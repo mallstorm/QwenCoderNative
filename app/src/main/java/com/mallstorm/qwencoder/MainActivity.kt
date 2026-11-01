@@ -57,9 +57,16 @@ class MainActivity : Activity() {
    allowFileAccess=false; allowContentAccess=true
    builtInZoomControls=false; displayZoomControls=false
    useWideViewPort=true; loadWithOverviewMode=true
+   userAgentString="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
    mixedContentMode=WebSettings.MIXED_CONTENT_NEVER_ALLOW
   }
   web.webViewClient=object:WebViewClient(){
+   override fun onPageFinished(view:WebView?,url:String?) {
+    super.onPageFinished(view,url)
+    if(url?.startsWith("https://coder.qwen.ai")==true) {
+     view?.evaluateJavascript("""(function(){let m=document.querySelector('meta[name=viewport]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.content='width=1280, initial-scale=0.65, minimum-scale=0.25, maximum-scale=3, user-scalable=yes';})();""",null)
+    }
+   }
    override fun shouldOverrideUrlLoading(view:WebView?,request:WebResourceRequest?):Boolean {
     val uri=request?.url ?: return false
     if(uri.scheme!="https") { if(uri.scheme=="mailto"||uri.scheme=="tel") external(uri);return true }
