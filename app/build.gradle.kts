@@ -2,7 +2,7 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
 android {
  namespace = "com.mallstorm.qwencoder"
  compileSdk = 35
- defaultConfig { applicationId = "com.mallstorm.qwencoder"; minSdk = 26; targetSdk = 32; versionCode = 2; versionName = "1.1" }
+ defaultConfig { applicationId = "com.mallstorm.qwencoder"; minSdk = 26; targetSdk = 32; versionCode = 3; versionName = "1.2" }
  compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
  kotlinOptions { jvmTarget = "17" }
 }

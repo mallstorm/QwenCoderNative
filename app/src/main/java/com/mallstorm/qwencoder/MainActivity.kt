@@ -1,61 +1,59 @@
 package com.mallstorm.qwencoder
 
 import android.app.Activity
-import android.os.Bundle
+import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.net.Uri
 import android.content.pm.ActivityInfo
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Button
-import android.graphics.Color
+import android.net.Uri
+import android.os.Bundle
+import android.widget.Toast
 import androidx.browser.customtabs.CustomTabsIntent
 
+/**
+ * Qwen runs in Chrome's authenticated browser context.
+ * This is a trampoline, not a second visible app window.
+ * Once Chrome opens, remove the launcher Activity from its task.
+ */
 class MainActivity : Activity() {
- private val url = "https://coder.qwen.ai/"
- override fun onCreate(savedInstanceState: Bundle?) {
-  super.onCreate(savedInstanceState)
-  requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-  val layout = LinearLayout(this).apply {
-   orientation = LinearLayout.VERTICAL
-   setPadding(36, 32, 36, 32)
-   setBackgroundColor(Color.rgb(25, 27, 32))
-  }
-  val title = TextView(this).apply {
-   text = "Qwen Coder · Desktop"
-   textSize = 22f
-   setTextColor(Color.WHITE)
-  }
-  val note = TextView(this).apply {
-   text = "Авторизация Google и Qwen работают в одной сессии браузера. После входа возвращайтесь в приложение через системную навигацию."
-   textSize = 15f
-   setTextColor(Color.LTGRAY)
-  }
-  val open = Button(this).apply {
-   text = "Открыть Qwen Coder"
-   setOnClickListener { openQwen() }
-  }
-  layout.addView(title)
-  layout.addView(note)
-  layout.addView(open)
-  setContentView(layout)
-  if(savedInstanceState == null) openQwen()
- }
- private fun openQwen() {
-  try {
-   val tabs = CustomTabsIntent.Builder()
-    .setShowTitle(false)
-    .setUrlBarHidingEnabled(true)
-    .build()
-   tabs.intent.setPackage("com.android.chrome")
-   tabs.launchUrl(this, Uri.parse(url))
-  } catch (_: Exception) {
-   try {
-    val tabs = CustomTabsIntent.Builder().setShowTitle(false).build()
-    tabs.launchUrl(this, Uri.parse(url))
-   } catch (_: Exception) {
-    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-   }
-  }
- }
+    private val qwenUrl = Uri.parse("https://coder.qwen.ai/")
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        openQwen()
+    }
+
+    private fun openQwen() {
+        val tab = CustomTabsIntent.Builder()
+            .setShowTitle(false)
+            .setUrlBarHidingEnabled(true)
+            .setShareState(CustomTabsIntent.SHARE_STATE_OFF)
+            .setColorScheme(CustomTabsIntent.COLOR_SCHEME_DARK)
+            .build()
+
+        try {
+            // Reuse Chrome's cookies for Qwen and Google OAuth.
+            tab.intent.setPackage("com.android.chrome")
+            tab.launchUrl(this, qwenUrl)
+            finish()
+            return
+        } catch (_: Exception) {
+            // Another browser may support Custom Tabs even if Chrome is absent.
+            try {
+                tab.intent.setPackage(null)
+                tab.launchUrl(this, qwenUrl)
+                finish()
+                return
+            } catch (_: Exception) {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, qwenUrl))
+                    finish()
+                    return
+                } catch (_: ActivityNotFoundException) {
+                    Toast.makeText(this, "Установите браузер Chrome", Toast.LENGTH_LONG).show()
+                    finish()
+                }
+            }
+        }
+    }
 }
