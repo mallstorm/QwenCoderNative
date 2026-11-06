@@ -12,226 +12,109 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.OpenableColumns
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.text.InputType
-import android.util.Base64
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.webkit.CookieManager
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.browser.customtabs.CustomTabsIntent
+import androidx.drawerlayout.widget.DrawerLayout
 import org.json.JSONObject
+import java.util.concurrent.Executors
 
-/**
- * Native chat UI on top of a hidden WebView that runs coder.qwen.ai.
- * The native layer mirrors the page's conversation and drives its input / send / stop controls.
- */
+/** Native Qwen Coder client: talks to coder.qwen.ai's REST/SSE API directly (no WebView chat). */
 class MainActivity : Activity() {
-    data class Msg(val role: String, val text: String)
+    private class Live {
+        val answer = StringBuilder()
+        val think = StringBuilder()
+        val steps = LinkedHashMap<String, Step>()
+        var error: String? = null
+    }
 
+    private lateinit var api: Api
     private lateinit var prefs: SharedPreferences
-    private lateinit var web: WebView
-    private lateinit var chatLayer: LinearLayout
+    private val ui = Handler(Looper.getMainLooper())
+    private val pool = Executors.newCachedThreadPool()
+
+    private lateinit var loginView: LinearLayout
+    private lateinit var tokenInput: EditText
+    private lateinit var loginStatus: TextView
+    private lateinit var drawer: DrawerLayout
+    private lateinit var taskBox: LinearLayout
+    private lateinit var accountView: TextView
+    private lateinit var titleView: TextView
+    private lateinit var subtitleView: TextView
     private lateinit var scroll: ScrollView
     private lateinit var list: LinearLayout
     private lateinit var emptyView: TextView
     private lateinit var input: EditText
     private lateinit var sendBtn: ImageButton
     private lateinit var micBtn: ImageButton
-    private lateinit var statusView: TextView
-    private lateinit var banner: TextView
-    private lateinit var chip: TextView
-    private lateinit var progress: ProgressBar
-    private lateinit var backToChat: TextView
 
-    private val ui = Handler(Looper.getMainLooper())
-    private var recognizer: SpeechRecognizer? = null
-    private var fileChooser: ValueCallback<Array<Uri>>? = null
-    private var listening = false
-    private var pageMode = false
-    private var busy = false
+    private var curId: String? = null
+    private var curTitle = ""
+    private var curRepo = ""
+    private var thread: List<ChatMsg> = emptyList()
+    private var leafId: String? = null
+    private var streaming = false
+    private var cancelled = false
+    private var running = false
+    private var live: Live? = null
     private var pending: String? = null
     private var pendingBase = 0
-    private var pendingAt = 0L
-    private var realCount = 0
-    private var shown: List<Msg> = emptyList()
-
-    private val home = "https://coder.qwen.ai/"
-    private val desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    private val mobileUA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+    private var shown: List<ChatMsg> = emptyList()
+    private var envs: List<Env>? = null
+    private var tasks: List<TaskItem> = emptyList()
+    private val expanded = HashSet<String>()
+    private var recognizer: SpeechRecognizer? = null
+    private var listening = false
 
     private fun dp(v: Int) = Md.dp(this, v)
-
-    private val poll = object : Runnable {
-        override fun run() {
-            tick()
-            ui.postDelayed(this, 800)
-        }
-    }
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+    private fun model(): String = prefs.getString("model", "qwen3-coder-plus") ?: "qwen3-coder-plus"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        api = Api(this)
         prefs = getSharedPreferences("qc", MODE_PRIVATE)
         window.statusBarColor = Theme.SURFACE
         window.navigationBarColor = Theme.BG
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-        WebView.setWebContentsDebuggingEnabled(true)
 
         val root = FrameLayout(this).apply { setBackgroundColor(Theme.BG) }
-        web = WebView(this)
-        root.addView(web, FrameLayout.LayoutParams(-1, -1))
-
-        // ---------- chat layer ----------
-        chatLayer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Theme.BG)
-            isClickable = true
-        }
-        root.addView(chatLayer, FrameLayout.LayoutParams(-1, -1))
-
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Theme.SURFACE)
-            setPadding(dp(16), 0, dp(6), 0)
-        }
-        val titleBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titleBox.addView(TextView(this).apply {
-            text = "Qwen Coder"
-            setTextColor(Theme.TEXT)
-            textSize = 17f
-            typeface = Typeface.DEFAULT_BOLD
-        })
-        statusView = TextView(this).apply {
-            text = "Подключение…"
-            setTextColor(Theme.MUTED)
-            textSize = 12f
-        }
-        titleBox.addView(statusView)
-        header.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(iconBtn(android.R.drawable.ic_menu_add, "Новый чат") { newChat() })
-        header.addView(iconBtn(android.R.drawable.ic_menu_view, "Страница Qwen") { showPage(true) })
-        header.addView(iconBtn(android.R.drawable.ic_menu_more, "Меню") { showMenu() })
-        chatLayer.addView(header, LinearLayout.LayoutParams(-1, dp(56)))
-
-        banner = TextView(this).apply {
-            text = "Нужен вход в Qwen. Нажмите, чтобы открыть страницу входа."
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            setBackgroundColor(Color.rgb(150, 90, 20))
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            visibility = View.GONE
-            setOnClickListener { showPage(true) }
-        }
-        chatLayer.addView(banner, LinearLayout.LayoutParams(-1, -2))
-
-        val body = FrameLayout(this)
-        list = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(8))
-        }
-        scroll = ScrollView(this).apply { addView(list, FrameLayout.LayoutParams(-1, -2)) }
-        body.addView(scroll, FrameLayout.LayoutParams(-1, -1))
-        emptyView = TextView(this).apply {
-            text = "Опишите задачу для Qwen Coder.\nРепозиторий и вход настраиваются на странице Qwen (кнопка вверху)."
-            setTextColor(Theme.MUTED)
-            textSize = 15f
-            gravity = Gravity.CENTER
-            setPadding(dp(32), 0, dp(32), 0)
-        }
-        body.addView(emptyView, FrameLayout.LayoutParams(-1, -1))
-        chatLayer.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        chip = TextView(this).apply {
-            setTextColor(Theme.TEXT)
-            textSize = 13f
-            background = Md.round(Theme.SURFACE, 14, this@MainActivity)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            visibility = View.GONE
-            setOnClickListener { visibility = View.GONE }
-        }
-        chatLayer.addView(chip, LinearLayout.LayoutParams(-2, -2).apply {
-            leftMargin = dp(12)
-            bottomMargin = dp(4)
-        })
-
-        val composer = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.BOTTOM
-            setPadding(dp(6), dp(6), dp(8), dp(8))
-            setBackgroundColor(Theme.BG)
-        }
-        composer.addView(iconBtn(android.R.drawable.ic_menu_upload, "Прикрепить файл") { pickFile() })
-        input = EditText(this).apply {
-            hint = "Сообщение Qwen Coder"
-            setHintTextColor(Theme.MUTED)
-            setTextColor(Theme.TEXT)
-            textSize = 16f
-            background = Md.round(Theme.SURFACE, 22, this@MainActivity)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            maxLines = 6
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-        }
-        composer.addView(input, LinearLayout.LayoutParams(0, -2, 1f).apply {
-            leftMargin = dp(2)
-            rightMargin = dp(4)
-        })
-        micBtn = iconBtn(android.R.drawable.ic_btn_speak_now, "Голосовой ввод") { toggleDictation() }
-        composer.addView(micBtn)
-        sendBtn = ImageButton(this).apply {
-            setImageResource(android.R.drawable.ic_menu_send)
-            setColorFilter(Color.WHITE)
-            contentDescription = "Отправить"
-            background = Md.round(Theme.ACCENT, 22, this@MainActivity)
-            setOnClickListener { send() }
-        }
-        composer.addView(sendBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(2) })
-        chatLayer.addView(composer, LinearLayout.LayoutParams(-1, -2))
-
-        // ---------- overlays ----------
-        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            visibility = View.GONE
-        }
-        root.addView(progress, FrameLayout.LayoutParams(-1, dp(3), Gravity.TOP))
-
-        backToChat = TextView(this).apply {
-            text = "←  Чат"
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            background = Md.round(Color.rgb(52, 77, 111), 18, this@MainActivity)
-            setPadding(dp(16), dp(8), dp(16), dp(8))
-            alpha = 0.95f
-            visibility = View.GONE
-            setOnClickListener { showPage(false) }
-        }
-        root.addView(backToChat, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
-            leftMargin = dp(8)
-            topMargin = dp(8)
-        })
-
+        drawer = buildMain()
+        root.addView(drawer, FrameLayout.LayoutParams(-1, -1))
+        loginView = buildLogin()
+        root.addView(loginView, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
-        configureWebView()
-        if (savedInstanceState == null) web.loadUrl(home) else web.restoreState(savedInstanceState)
+
+        if (api.loggedIn) showMain() else showLogin()
+    }
+
+    // ---------- UI construction ----------
+
+    private fun pill(text: String, filled: Boolean, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        setTextColor(Color.WHITE)
+        textSize = 15f
+        gravity = Gravity.CENTER
+        background = Md.round(if (filled) Theme.ACCENT else Theme.SURFACE, 22, this@MainActivity)
+        setPadding(dp(18), dp(12), dp(18), dp(12))
+        setOnClickListener { onClick() }
     }
 
     private fun iconBtn(res: Int, desc: String, onClick: () -> Unit) = ImageButton(this).apply {
@@ -243,163 +126,467 @@ class MainActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
-    override fun onResume() {
-        super.onResume()
-        web.onResume()
-        ui.post(poll)
-    }
-
-    override fun onPause() {
-        ui.removeCallbacks(poll)
-        web.onPause()
-        super.onPause()
-    }
-
-    // ---------- WebView ----------
-
-    private fun cfgJson(): String = JSONObject().apply {
-        put("msg", prefs.getString("sel_msg", ""))
-        put("input", prefs.getString("sel_input", ""))
-        put("send", prefs.getString("sel_send", ""))
-        put("stop", prefs.getString("sel_stop", ""))
-    }.toString()
-
-    private fun configureWebView() {
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
-        web.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            builtInZoomControls = true
-            displayZoomControls = false
-            textZoom = 100
-            userAgentString = if (prefs.getBoolean("desktop", true)) desktopUA else mobileUA
-            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            allowFileAccess = false
-            allowContentAccess = true
-            javaScriptCanOpenWindowsAutomatically = false
-            setSupportMultipleWindows(false)
+    private fun buildLogin(): LinearLayout {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Theme.BG)
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            isClickable = true
         }
-        web.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val uri = request?.url ?: return false
-                val host = uri.host.orEmpty().lowercase()
-                if (uri.scheme != "https") {
-                    if (uri.scheme == "mailto" || uri.scheme == "tel") launchExternal(uri)
-                    return true
-                }
-                if (host == "accounts.google.com" || (host == "auth.qwen.ai" && uri.path.orEmpty().contains("oauth/google"))) {
-                    showGoogleLoginNotice()
-                    return true
-                }
-                if (host == "coder.qwen.ai" || host == "auth.qwen.ai" || host.endsWith(".qwen.ai")) return false
-                launchExternal(uri)
-                return true
-            }
+        box.addView(TextView(this).apply {
+            text = "Qwen Coder"
+            setTextColor(Theme.TEXT)
+            textSize = 26f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        box.addView(TextView(this).apply {
+            text = "Вставьте значение cookie refresh_token с coder.qwen.ai.\n\n" +
+                "Где взять: в Chrome на компьютере откройте coder.qwen.ai (вы уже вошли), F12 → Application → Cookies → .qwen.ai → refresh_token → скопируйте Value. " +
+                "Подойдёт и строка Cookie целиком, и JSON-экспорт расширения Cookie-Editor.\n\n" +
+                "Токен хранится только на этом телефоне."
+            setTextColor(Theme.MUTED)
+            textSize = 14f
+            setPadding(0, dp(12), 0, dp(12))
+        })
+        tokenInput = EditText(this).apply {
+            hint = "refresh_token"
+            setHintTextColor(Theme.MUTED)
+            setTextColor(Theme.TEXT)
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            minLines = 4
+            maxLines = 8
+            gravity = Gravity.TOP
+            background = Md.round(Theme.SURFACE, 14, this@MainActivity)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        box.addView(tokenInput, LinearLayout.LayoutParams(-1, -2))
+        loginStatus = TextView(this).apply {
+            setTextColor(Color.rgb(240, 170, 90))
+            textSize = 13f
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        box.addView(loginStatus)
+        box.addView(pill("Войти", true) { doLogin(tokenInput.text.toString()) }, LinearLayout.LayoutParams(-1, -2))
+        box.addView(pill("Войти через браузер приложения (email)", false) {
+            startActivityForResult(Intent(this, WebLoginActivity::class.java), 3001)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        return box
+    }
 
-            override fun onPageFinished(view: WebView?, url: String?) {
-                super.onPageFinished(view, url)
-                if (url?.startsWith("https://") == true && url.contains("qwen.ai")) {
-                    view?.evaluateJavascript(
-                        "(function(){var m=document.querySelector('meta[name=\"viewport\"]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.setAttribute('content','width=1280, minimum-scale=0.2, maximum-scale=3, user-scalable=yes');return true;})();",
-                        null
-                    )
-                    Bridge.inject(this@MainActivity, web, cfgJson())
-                }
-            }
+    private fun buildMain(): DrawerLayout {
+        val dl = DrawerLayout(this)
 
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                if (request?.isForMainFrame == true) {
-                    Toast.makeText(this@MainActivity, "Ошибка загрузки Qwen. Проверьте сеть и VPN.", Toast.LENGTH_LONG).show()
-                }
+        // ----- content -----
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Theme.BG)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Theme.SURFACE)
+            setPadding(dp(4), 0, dp(4), 0)
+        }
+        header.addView(iconBtn(android.R.drawable.ic_menu_agenda, "Задачи") { drawer.openDrawer(Gravity.START) })
+        val titleBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titleView = TextView(this).apply {
+            text = "Qwen Coder"
+            setTextColor(Theme.TEXT)
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        subtitleView = TextView(this).apply {
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        titleBox.addView(titleView)
+        titleBox.addView(subtitleView)
+        header.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(4) })
+        header.addView(iconBtn(android.R.drawable.ic_menu_add, "Новая задача") { showNewTask(null) })
+        header.addView(iconBtn(android.R.drawable.ic_menu_more, "Меню") { showMenu() })
+        content.addView(header, LinearLayout.LayoutParams(-1, dp(56)))
+
+        val body = FrameLayout(this)
+        list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(8))
+        }
+        scroll = ScrollView(this).apply { addView(list, FrameLayout.LayoutParams(-1, -2)) }
+        body.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+        emptyView = TextView(this).apply {
+            text = "Выберите задачу слева или создайте новую (+)."
+            setTextColor(Theme.MUTED)
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setPadding(dp(32), 0, dp(32), 0)
+        }
+        body.addView(emptyView, FrameLayout.LayoutParams(-1, -1))
+        content.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        val composer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            setPadding(dp(10), dp(6), dp(8), dp(8))
+            setBackgroundColor(Theme.BG)
+        }
+        input = EditText(this).apply {
+            hint = "Сообщение Qwen Coder"
+            setHintTextColor(Theme.MUTED)
+            setTextColor(Theme.TEXT)
+            textSize = 16f
+            background = Md.round(Theme.SURFACE, 22, this@MainActivity)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            maxLines = 6
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        composer.addView(input, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) })
+        micBtn = iconBtn(android.R.drawable.ic_btn_speak_now, "Голосовой ввод") { toggleDictation() }
+        composer.addView(micBtn)
+        sendBtn = ImageButton(this).apply {
+            setImageResource(android.R.drawable.ic_menu_send)
+            setColorFilter(Color.WHITE)
+            contentDescription = "Отправить"
+            background = Md.round(Theme.ACCENT, 22, this@MainActivity)
+            setOnClickListener { send() }
+        }
+        composer.addView(sendBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(2) })
+        content.addView(composer, LinearLayout.LayoutParams(-1, -2))
+        dl.addView(content, DrawerLayout.LayoutParams(-1, -1))
+
+        // ----- drawer -----
+        val side = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Theme.BG)
+            isClickable = true
+        }
+        side.addView(TextView(this).apply {
+            text = "Задачи"
+            setTextColor(Theme.TEXT)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(18), dp(22), dp(18), dp(10))
+        })
+        side.addView(pill("+  Новая задача", true) {
+            drawer.closeDrawers()
+            showNewTask(null)
+        }, LinearLayout.LayoutParams(-1, -2).apply {
+            leftMargin = dp(14)
+            rightMargin = dp(14)
+            bottomMargin = dp(8)
+        })
+        taskBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        side.addView(ScrollView(this).apply { addView(taskBox, FrameLayout.LayoutParams(-1, -2)) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        accountView = TextView(this).apply {
+            setTextColor(Theme.MUTED)
+            textSize = 13f
+            setPadding(dp(18), dp(12), dp(18), dp(14))
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity).setTitle("Выйти из аккаунта?")
+                    .setPositiveButton("Выйти") { _, _ -> logout() }
+                    .setNegativeButton("Отмена", null).show()
             }
         }
-        web.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                progress.progress = newProgress
-                progress.visibility = if (newProgress >= 100) View.GONE else View.VISIBLE
-            }
-
-            override fun onShowFileChooser(view: WebView?, callback: ValueCallback<Array<Uri>>?, params: FileChooserParams?): Boolean {
-                fileChooser?.onReceiveValue(null)
-                fileChooser = callback
-                return try {
-                    startActivityForResult(params?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply { type = "*/*" }, 1001)
-                    true
-                } catch (_: Exception) {
-                    fileChooser = null
-                    false
-                }
-            }
-        }
+        side.addView(accountView)
+        dl.addView(side, DrawerLayout.LayoutParams(dp(300), -1).apply { gravity = Gravity.START })
+        return dl
     }
 
-    private fun showPage(on: Boolean) {
-        pageMode = on
-        chatLayer.visibility = if (on) View.GONE else View.VISIBLE
-        backToChat.visibility = if (on) View.VISIBLE else View.GONE
-        hideKeyboard()
-        if (on) web.requestFocus()
+    private fun showLogin() {
+        loginView.visibility = View.VISIBLE
+        drawer.visibility = View.GONE
     }
 
-    private fun hideKeyboard() {
-        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken, 0)
-    }
-
-    // ---------- mirroring ----------
-
-    private fun tick() {
-        if (pageMode) return
-        web.evaluateJavascript("(window.__QC&&window.__QC.v===3)?window.__QC.snapshot():null") { raw ->
-            val s = Bridge.unquote(raw)
-            if (s == null) {
-                Bridge.inject(this, web, cfgJson())
-                return@evaluateJavascript
-            }
+    private fun showMain() {
+        loginView.visibility = View.GONE
+        drawer.visibility = View.VISIBLE
+        accountView.text = (api.userName.ifEmpty { api.userEmail }).ifEmpty { "Аккаунт Qwen" } + "  ·  выйти"
+        updateHeader()
+        render(emptyList())
+        loadTasks()
+        pool.execute {
             try {
-                applySnapshot(JSONObject(s))
-            } catch (_: Exception) {
+                api.me()
+                ui.post { accountView.text = (api.userName.ifEmpty { api.userEmail }).ifEmpty { "Аккаунт Qwen" } + "  ·  выйти" }
+            } catch (e: Exception) {
+                ui.post { handleError(e) }
             }
         }
     }
 
-    private fun applySnapshot(o: JSONObject) {
-        val login = o.optBoolean("login")
-        val hasInput = o.optBoolean("hasInput")
-        busy = o.optBoolean("busy")
-        val arr = o.optJSONArray("msgs")
-        val msgs = ArrayList<Msg>()
-        if (arr != null) {
-            for (i in 0 until arr.length()) {
-                val m = arr.getJSONObject(i)
-                msgs.add(Msg(m.optString("r"), m.optString("t")))
+    private fun logout() {
+        api.cancelStream()
+        api.logout()
+        curId = null
+        thread = emptyList()
+        tasks = emptyList()
+        envs = null
+        showLogin()
+    }
+
+    private fun handleError(e: Exception) {
+        if (e is ApiError && e.code == "auth") {
+            toast("Сессия истекла: войдите заново")
+            api.logout()
+            showLogin()
+        } else {
+            toast(e.message ?: "Ошибка сети")
+        }
+    }
+
+    // ---------- login ----------
+
+    private fun doLogin(raw: String) {
+        val (a, r) = TokenParser.extract(raw)
+        if (a == null && r == null) {
+            loginStatus.text = "В тексте не найден токен (ожидается строка, начинающаяся с eyJ…)"
+            return
+        }
+        loginStatus.text = "Проверяю вход…"
+        pool.execute {
+            try {
+                api.setTokens(a, r)
+                api.ensureAccess(!r.isNullOrEmpty())
+                api.me()
+                ui.post {
+                    loginStatus.text = ""
+                    tokenInput.setText("")
+                    showMain()
+                }
+            } catch (e: Exception) {
+                api.logout()
+                ui.post { loginStatus.text = "Не удалось войти: " + (e.message ?: "ошибка") }
             }
         }
-        realCount = msgs.size
-        statusView.text = when {
-            login -> "Нужен вход"
-            busy -> "Qwen отвечает…"
-            hasInput -> "Готов"
-            else -> "Загрузка страницы…"
-        }
-        banner.visibility = if (login) View.VISIBLE else View.GONE
-        sendBtn.setImageResource(if (busy) android.R.drawable.ic_media_pause else android.R.drawable.ic_menu_send)
+    }
 
+    // ---------- tasks ----------
+
+    private fun statusLabel(s: String) = when (s) {
+        "running" -> "выполняется"
+        "finished" -> "готово"
+        "" -> ""
+        else -> s
+    }
+
+    private fun loadTasks() {
+        pool.execute {
+            try {
+                val t = api.tasks(1)
+                ui.post {
+                    tasks = t
+                    renderTasks()
+                }
+            } catch (e: Exception) {
+                ui.post { handleError(e) }
+            }
+        }
+    }
+
+    private fun renderTasks() {
+        taskBox.removeAllViews()
+        if (tasks.isEmpty()) {
+            taskBox.addView(TextView(this).apply {
+                text = "Пока нет задач"
+                setTextColor(Theme.MUTED)
+                setPadding(dp(18), dp(12), dp(18), dp(12))
+            })
+            return
+        }
+        for (t in tasks) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(18), dp(10), dp(18), dp(10))
+                if (t.id == curId) setBackgroundColor(Theme.SURFACE)
+                setOnClickListener {
+                    drawer.closeDrawers()
+                    openTask(t.id, t.title, t.repo, t.branch)
+                }
+                setOnLongClickListener {
+                    AlertDialog.Builder(this@MainActivity).setTitle("Удалить задачу?").setMessage(t.title)
+                        .setPositiveButton("Удалить") { _, _ -> deleteTask(t.id) }
+                        .setNegativeButton("Отмена", null).show()
+                    true
+                }
+            }
+            row.addView(TextView(this).apply {
+                text = t.title.ifEmpty { "Без названия" }
+                setTextColor(Theme.TEXT)
+                textSize = 15f
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            val sub = listOf(t.repo, t.branch, statusLabel(t.status)).filter { it.isNotEmpty() }.joinToString(" · ")
+            row.addView(TextView(this).apply {
+                text = sub
+                setTextColor(Theme.MUTED)
+                textSize = 12f
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            taskBox.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+    }
+
+    private fun deleteTask(id: String) {
+        pool.execute {
+            try {
+                api.deleteTask(id)
+                ui.post {
+                    if (curId == id) {
+                        curId = null
+                        thread = emptyList()
+                        updateHeader()
+                        render(emptyList())
+                    }
+                    loadTasks()
+                }
+            } catch (e: Exception) {
+                ui.post { handleError(e) }
+            }
+        }
+    }
+
+    private fun resetChat(id: String?, title: String, repo: String, branch: String) {
+        curId = id
+        curTitle = title
+        curRepo = listOf(repo, branch).filter { it.isNotEmpty() }.joinToString(" · ")
+        thread = emptyList()
+        leafId = null
+        live = null
+        pending = null
+        streaming = false
+        running = false
+        cancelled = false
+        expanded.clear()
+        updateSend()
+        updateHeader()
+        render(emptyList())
+        renderTasks()
+    }
+
+    private fun openTask(id: String, title: String, repo: String, branch: String) {
+        resetChat(id, title, repo, branch)
+        fetchDetail(id)
+    }
+
+    private fun updateHeader() {
+        titleView.text = curTitle.ifEmpty { "Qwen Coder" }
+        val state = if (streaming || running) "работает…" else ""
+        subtitleView.text = listOf(curRepo, state).filter { it.isNotEmpty() }.joinToString(" · ")
+        subtitleView.visibility = if (subtitleView.text.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun updateSend() {
+        sendBtn.setImageResource(if (streaming) android.R.drawable.ic_media_pause else android.R.drawable.ic_menu_send)
+    }
+
+    // ---------- detail / polling ----------
+
+    private fun fetchDetail(id: String) {
+        pool.execute {
+            try {
+                val st = api.taskStatus(id)
+                val d = api.taskDetail(id)
+                ui.post {
+                    if (curId == id) {
+                        running = st == "running"
+                        applyDetail(d)
+                        if (running) startPolling()
+                    }
+                }
+            } catch (e: Exception) {
+                ui.post { handleError(e) }
+            }
+        }
+    }
+
+    private fun applyDetail(d: JSONObject) {
+        thread = api.parseThread(d)
+        leafId = thread.lastOrNull()?.id
+        val title = d.optString("title")
+        if (title.isNotEmpty() && title != "null") curTitle = title
+        val info = d.optJSONObject("meta")?.optJSONObject("repo_info")
+        if (info != null) {
+            val repo = info.optString("repository")
+            val br = info.optString("selected_branch")
+            curRepo = listOf(repo, br).filter { it.isNotEmpty() }.joinToString(" · ")
+        }
+        updateHeader()
+        rebuildDisplay()
+    }
+
+    private val poll = object : Runnable {
+        override fun run() {
+            val id = curId ?: return
+            if (!(streaming || running)) return
+            pool.execute {
+                try {
+                    val st = api.taskStatus(id)
+                    val d = api.taskDetail(id)
+                    ui.post {
+                        if (curId == id) {
+                            val was = running
+                            running = st == "running"
+                            applyDetail(d)
+                            if (was && !running) loadTasks()
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            ui.postDelayed(this, 2500)
+        }
+    }
+
+    private fun startPolling() {
+        ui.removeCallbacks(poll)
+        ui.postDelayed(poll, 1500)
+    }
+
+    private val renderTick = Runnable { rebuildDisplay() }
+    private fun scheduleRender() {
+        ui.removeCallbacks(renderTick)
+        ui.postDelayed(renderTick, 90)
+    }
+
+    private fun rebuildDisplay() {
+        val base = ArrayList(thread)
         val p = pending
         if (p != null) {
-            val key = p.take(30)
-            val matched = msgs.drop(pendingBase).any { it.role == "user" && it.text.contains(key) }
-            if (matched || System.currentTimeMillis() - pendingAt > 20000) pending = null
+            val users = base.filter { it.role == "user" }
+            if (users.size > pendingBase && users.drop(pendingBase).any { it.text.trim() == p.trim() }) pending = null
         }
         val p2 = pending
-        render(if (p2 != null) msgs + Msg("user", p2) else msgs)
+        if (p2 != null) base.add(ChatMsg("pending", "user", p2, emptyList(), "", null, true))
+        val lv = live
+        if (streaming && lv != null) {
+            val lm = ChatMsg("live", "assistant", lv.answer.toString(), lv.steps.values.toList(), lv.think.toString(), lv.error, false)
+            val last = base.lastOrNull()
+            if (last == null || last.role == "user") {
+                base.add(lm)
+            } else if (!(last.text.length >= lm.text.length && last.steps.size >= lm.steps.size)) {
+                base[base.size - 1] = lm.copy(id = last.id)
+            }
+        } else if (running && base.lastOrNull()?.role == "user") {
+            base.add(ChatMsg("wait", "assistant", "", emptyList(), "", null, false))
+        }
+        render(base)
     }
 
-    private fun render(display: List<Msg>) {
-        if (display == shown) return
+    // ---------- rendering ----------
+
+    private fun render(display: List<ChatMsg>) {
+        if (display == shown) {
+            emptyView.visibility = if (display.isEmpty()) View.VISIBLE else View.GONE
+            return
+        }
         val child = scroll.getChildAt(0)
         val atBottom = child == null || child.height - (scroll.height + scroll.scrollY) < dp(160)
         for (i in display.indices) {
@@ -414,7 +601,7 @@ class MainActivity : Activity() {
         if (atBottom) scroll.post { scroll.scrollTo(0, scroll.getChildAt(0).height) }
     }
 
-    private fun makeView(m: Msg): View {
+    private fun makeView(m: ChatMsg): View {
         if (m.role == "user") {
             val wrap = LinearLayout(this).apply {
                 gravity = Gravity.END
@@ -435,229 +622,277 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(18) }
         }
-        Md.render(this, col, m.text)
+        if (m.steps.isNotEmpty()) col.addView(stepsView(m))
+        if (m.text.isNotBlank()) {
+            val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            Md.render(this, box, m.text)
+            col.addView(box)
+        } else if (m.error == null) {
+            col.addView(TextView(this).apply {
+                text = if (m.done) "(пустой ответ)" else "Qwen работает…"
+                setTextColor(Theme.MUTED)
+                textSize = 14f
+            })
+        }
+        if (m.error != null) {
+            col.addView(TextView(this).apply {
+                text = "Ошибка: " + m.error
+                setTextColor(Color.rgb(240, 110, 110))
+                textSize = 14f
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
         return col
     }
 
-    // ---------- actions ----------
+    private fun stepsView(m: ChatMsg): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Md.round(Theme.SURFACE, 12, this@MainActivity)
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }
+        }
+        card.addView(TextView(this).apply {
+            text = "Действия: " + m.steps.size
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            setPadding(0, 0, 0, dp(4))
+        })
+        for (s in m.steps) {
+            val ok = s.status == "finished" || s.status == "done" || s.status == "success"
+            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val logView = TextView(this).apply {
+                text = if (s.log.length > 6000) s.log.take(6000) + "\n…" else s.log.ifEmpty { "(нет вывода)" }
+                typeface = Typeface.MONOSPACE
+                textSize = 11.5f
+                setTextColor(Color.rgb(190, 200, 215))
+                setTextIsSelectable(true)
+                setPadding(dp(4), dp(2), dp(4), dp(6))
+                visibility = if (expanded.contains(s.id)) View.VISIBLE else View.GONE
+            }
+            val title = TextView(this).apply {
+                text = (if (ok) "✓ " else "● ") + s.type.ifEmpty { "Шаг" } + " · " + s.action.replace("\n", " ").take(110)
+                setTextColor(if (ok) Color.rgb(130, 200, 150) else Color.rgb(240, 180, 90))
+                textSize = 13f
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, dp(4), 0, dp(4))
+                setOnClickListener {
+                    if (logView.visibility == View.VISIBLE) {
+                        logView.visibility = View.GONE
+                        expanded.remove(s.id)
+                    } else {
+                        logView.visibility = View.VISIBLE
+                        expanded.add(s.id)
+                    }
+                }
+            }
+            row.addView(title)
+            row.addView(logView)
+            card.addView(row)
+        }
+        return card
+    }
+
+    // ---------- sending ----------
 
     private fun send() {
-        if (busy) {
-            web.evaluateJavascript("(window.__QC?window.__QC.stop():'none')", null)
+        if (streaming) {
+            cancelled = true
+            api.cancelStream()
+            toast("Остановлено на телефоне. Задача может продолжить работу на сервере.")
             return
         }
         val t = input.text.toString().trim()
         if (t.isEmpty()) return
-        val b64 = Base64.encodeToString(t.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        web.evaluateJavascript("(window.__QC?window.__QC.send('" + b64 + "'):'nobridge')") { r ->
-            if (Bridge.unquote(r) == "ok") {
-                input.setText("")
-                chip.visibility = View.GONE
-                pending = t
-                pendingBase = realCount
-                pendingAt = System.currentTimeMillis()
-                applyPendingNow()
-            } else {
-                Toast.makeText(this, "Не найдено поле ввода Qwen. Откройте страницу (кнопка вверху) и войдите.", Toast.LENGTH_LONG).show()
-            }
+        val id = curId
+        if (id == null) {
+            showNewTask(t)
+            return
         }
+        input.setText("")
+        startStream(id, t)
     }
 
-    private fun applyPendingNow() {
-        val p = pending ?: return
-        val base = shown.filter { !(it.role == "user" && it.text == p) }
-        render(base + Msg("user", p))
-    }
-
-    private fun newChat() {
-        web.evaluateJavascript("(window.__QC?window.__QC.newChat():'none')") { r ->
-            if (Bridge.unquote(r) != "ok") {
-                Toast.makeText(this, "Кнопка нового чата не найдена, открываю главную", Toast.LENGTH_SHORT).show()
-                web.loadUrl(home)
-            }
-            pending = null
-        }
-    }
-
-    private fun pickFile() {
-        try {
-            startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "*/*"
-                addCategory(Intent.CATEGORY_OPENABLE)
-            }, 1002)
-        } catch (_: Exception) {
-            Toast.makeText(this, "Нет приложения для выбора файлов", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun queryName(uri: Uri): String {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val n = c.getString(0)
-                if (!n.isNullOrBlank()) return n
-            }
-        }
-        return uri.lastPathSegment ?: "file"
-    }
-
-    private fun handlePicked(uri: Uri) {
-        Thread {
+    private fun startStream(id: String, text: String) {
+        streaming = true
+        cancelled = false
+        live = Live()
+        pending = text
+        pendingBase = thread.count { it.role == "user" }
+        updateSend()
+        updateHeader()
+        rebuildDisplay()
+        startPolling()
+        val parent = leafId
+        val mdl = model()
+        pool.execute {
+            var err: String? = null
             try {
-                val name = queryName(uri)
-                val mime = contentResolver.getType(uri) ?: "application/octet-stream"
-                val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-                if (bytes.size > 8 * 1024 * 1024) {
-                    runOnUiThread { Toast.makeText(this, "Файл больше 8 МБ", Toast.LENGTH_LONG).show() }
-                } else {
-                    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    runOnUiThread { uploadToPage(name, mime, b64) }
+                api.stream(id, text, parent, mdl) { data -> ui.post { applyLive(id, data) } }
+            } catch (e: Exception) {
+                if (!cancelled) {
+                    err = e.message ?: e.javaClass.simpleName
+                    if (e is ApiError && e.code == "auth") ui.post { handleError(e) }
                 }
-            } catch (_: Exception) {
-                runOnUiThread { Toast.makeText(this, "Не удалось прочитать файл", Toast.LENGTH_SHORT).show() }
             }
-        }.start()
-    }
-
-    private fun uploadToPage(name: String, mime: String, b64: String) {
-        val id = System.currentTimeMillis().toString()
-        web.evaluateJavascript("__QC.chunkStart('" + id + "')", null)
-        var i = 0
-        while (i < b64.length) {
-            val end = minOf(i + 400000, b64.length)
-            web.evaluateJavascript("__QC.chunk('" + id + "','" + b64.substring(i, end) + "')", null)
-            i = end
-        }
-        val nameB64 = Base64.encodeToString(name.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        web.evaluateJavascript("__QC.attachFile('" + id + "','" + nameB64 + "','" + mime.replace("'", "") + "')") { r ->
-            if (Bridge.unquote(r) == "ok") {
-                chip.text = "📎 " + name + "   ✕"
-                chip.visibility = View.VISIBLE
-            } else {
-                Toast.makeText(this, "Поле загрузки не найдено. Прикрепите файл на странице Qwen.", Toast.LENGTH_LONG).show()
+            val errMsg: String? = err
+            ui.post {
+                if (curId == id) {
+                    streaming = false
+                    updateSend()
+                    if (errMsg != null) toast(errMsg)
+                    fetchDetail(id)
+                    loadTasks()
+                }
             }
         }
     }
 
-    // ---------- menu ----------
-
-    private fun showMenu() {
-        val desktop = prefs.getBoolean("desktop", true)
-        val choices = arrayOf(
-            "Страница Qwen (вход, репозиторий)",
-            "Войти по email / коду",
-            "Войти через Google в Chrome",
-            "Обновить страницу",
-            if (desktop) "Режим страницы: десктоп (сменить на мобильный)" else "Режим страницы: мобильный (сменить на десктоп)",
-            "Селекторы элементов",
-            "Диагностика страницы (копировать)",
-            "Выйти (очистить cookies)"
-        )
-        AlertDialog.Builder(this)
-            .setTitle("Qwen Coder Native")
-            .setItems(choices) { _, which ->
-                when (which) {
-                    0 -> showPage(true)
-                    1 -> { web.loadUrl("https://coder.qwen.ai/auth"); showPage(true) }
-                    2 -> showGoogleLoginNotice()
-                    3 -> web.reload()
-                    4 -> {
-                        prefs.edit().putBoolean("desktop", !desktop).apply()
-                        web.settings.userAgentString = if (!desktop) desktopUA else mobileUA
-                        web.reload()
-                    }
-                    5 -> showSelectors()
-                    6 -> showDump()
-                    7 -> {
-                        CookieManager.getInstance().removeAllCookies(null)
-                        web.clearCache(true)
-                        web.loadUrl(home)
-                        pending = null
-                    }
+    private fun applyLive(id: String, data: String) {
+        if (curId != id) return
+        val lv = live ?: return
+        try {
+            val j = JSONObject(data)
+            j.optJSONObject("error")?.let { e -> lv.error = e.optString("details").ifEmpty { e.optString("code") } }
+            val delta = j.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")
+            if (delta != null) {
+                val phase = delta.optString("phase").ifEmpty { "answer" }
+                val content = delta.optString("content")
+                when {
+                    phase == "answer" -> lv.answer.append(content)
+                    phase.startsWith("think") -> lv.think.append(content)
+                    else -> api.mergeSteps(lv.steps, delta.optJSONObject("extra")?.optJSONArray("log_list"))
                 }
-            }.show()
+            }
+        } catch (_: Exception) {
+        }
+        scheduleRender()
     }
 
-    private fun showSelectors() {
+    // ---------- new task ----------
+
+    private fun showNewTask(text: String?) {
+        toast("Загружаю репозитории…")
+        pool.execute {
+            try {
+                val e = envs ?: api.environments().also { envs = it }
+                ui.post { newTaskDialog(e, text) }
+            } catch (ex: Exception) {
+                ui.post { handleError(ex) }
+            }
+        }
+    }
+
+    private fun newTaskDialog(envList: List<Env>, text: String?) {
+        val names = listOf("Без репозитория") + envList.map { it.repo.ifEmpty { it.name } }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), 0)
         }
-        val keys = listOf(
-            "sel_msg" to "CSS: сообщения",
-            "sel_input" to "CSS: поле ввода",
-            "sel_send" to "CSS: кнопка отправки",
-            "sel_stop" to "CSS: кнопка остановки"
-        )
-        val fields = keys.map { (k, label) ->
-            EditText(this).apply {
-                hint = label
-                setSingleLine()
-                setText(prefs.getString(k, ""))
-            }.also { box.addView(it) }
+        val envSp = Spinner(this)
+        envSp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+        val brSp = Spinner(this)
+        val modelEt = EditText(this).apply {
+            hint = "Модель"
+            setSingleLine()
+            setText(model())
         }
+        fun fill(pos: Int) {
+            val bs: List<String> = if (pos == 0) emptyList<String>() else envList[pos - 1].branches.sortedBy { if (it == "main" || it == "master") 0 else 1 }
+            brSp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, bs)
+            brSp.isEnabled = bs.isNotEmpty()
+        }
+        envSp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) = fill(position)
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        box.addView(TextView(this).apply { this.text = "Репозиторий" })
+        box.addView(envSp)
+        box.addView(TextView(this).apply { this.text = "Ветка" })
+        box.addView(brSp)
+        box.addView(modelEt)
+        val last = prefs.getInt("last_env", 0)
+        if (last in names.indices) envSp.setSelection(last)
+        fill(envSp.selectedItemPosition)
+
         AlertDialog.Builder(this)
-            .setTitle("Селекторы (пусто = авто)")
+            .setTitle("Новая задача")
             .setView(box)
-            .setPositiveButton("Сохранить") { _, _ ->
-                val e = prefs.edit()
-                keys.forEachIndexed { i, kv -> e.putString(kv.first, fields[i].text.toString().trim()) }
-                e.apply()
-                Bridge.inject(this, web, cfgJson())
+            .setPositiveButton("Создать") { _, _ ->
+                val pos = envSp.selectedItemPosition
+                val env = if (pos == 0) null else envList[pos - 1]
+                val branch = (brSp.selectedItem as? String).orEmpty()
+                val mdl = modelEt.text.toString().trim().ifEmpty { "qwen3-coder-plus" }
+                prefs.edit().putString("model", mdl).putInt("last_env", pos).apply()
+                pool.execute {
+                    try {
+                        val id = api.newTask(env, branch, mdl)
+                        ui.post {
+                            resetChat(id, "Новый чат", env?.repo ?: "", branch)
+                            if (text != null) {
+                                input.setText("")
+                                startStream(id, text)
+                            }
+                            loadTasks()
+                        }
+                    } catch (e: Exception) {
+                        ui.post { handleError(e) }
+                    }
+                }
             }
             .setNegativeButton("Отмена", null)
             .show()
     }
 
-    private fun showDump() {
-        web.evaluateJavascript("(window.__QC?window.__QC.dump():'Мост не подключён: страница ещё не загружена')") { r ->
-            val s = Bridge.unquote(r) ?: "Нет данных"
-            val tv = TextView(this).apply {
-                text = s
-                typeface = Typeface.MONOSPACE
-                textSize = 10f
-                setTextIsSelectable(true)
-                setPadding(dp(12), dp(8), dp(12), dp(8))
-            }
-            val sv = ScrollView(this).apply { addView(tv) }
-            AlertDialog.Builder(this)
-                .setTitle("Структура страницы")
-                .setView(sv)
-                .setPositiveButton("Копировать") { _, _ -> Md.copy(this, s) }
-                .setNegativeButton("Закрыть", null)
-                .show()
-        }
-    }
+    // ---------- menu ----------
 
-    private fun showGoogleLoginNotice() {
-        AlertDialog.Builder(this)
-            .setTitle("Вход Google")
-            .setMessage("Google-авторизация в Android WebView может блокироваться, а Chrome не передаёт свою сессию в WebView. Используйте вход по email с кодом подтверждения.")
-            .setPositiveButton("Войти по email") { _, _ ->
-                web.loadUrl("https://coder.qwen.ai/auth")
-                showPage(true)
-            }
-            .setNeutralButton("Открыть Chrome") { _, _ -> openChrome() }
-            .setNegativeButton("Отмена", null)
-            .show()
-    }
-
-    private fun openChrome() {
+    private fun openUrl(url: String) {
         try {
-            val tab = CustomTabsIntent.Builder().setShowTitle(false).setUrlBarHidingEnabled(true)
-                .setShareState(CustomTabsIntent.SHARE_STATE_OFF).build()
+            val tab = CustomTabsIntent.Builder().build()
             tab.intent.setPackage("com.android.chrome")
-            tab.launchUrl(this, Uri.parse(home))
+            tab.launchUrl(this, Uri.parse(url))
         } catch (_: Exception) {
-            launchExternal(Uri.parse(home))
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            } catch (_: Exception) {
+                toast("Нет приложения для открытия ссылки")
+            }
         }
     }
 
-    private fun launchExternal(uri: Uri) {
-        try {
-            startActivity(Intent(Intent.ACTION_VIEW, uri))
-        } catch (_: Exception) {
-            Toast.makeText(this, "Нет приложения для открытия ссылки", Toast.LENGTH_SHORT).show()
+    private fun showMenu() {
+        val id = curId
+        val items = ArrayList<Pair<String, () -> Unit>>()
+        if (id != null) {
+            items.add("Открыть превью проекта" to { openUrl("https://$id.preview.qwenlm.io/") })
+            items.add("Открыть задачу на сайте" to { openUrl("https://coder.qwen.ai/c/$id") })
         }
+        items.add("Репозитории и GitHub (сайт)" to { openUrl("https://coder.qwen.ai/") })
+        items.add("Модель: " + model() to { changeModel() })
+        items.add("Обновить" to {
+            envs = null
+            loadTasks()
+            if (id != null) fetchDetail(id)
+        })
+        items.add("Выйти" to { logout() })
+        AlertDialog.Builder(this)
+            .setTitle("Qwen Coder")
+            .setItems(items.map { it.first }.toTypedArray()) { _, which -> items[which].second() }
+            .show()
+    }
+
+    private fun changeModel() {
+        val et = EditText(this).apply {
+            setSingleLine()
+            setText(model())
+        }
+        AlertDialog.Builder(this).setTitle("ID модели").setView(et)
+            .setPositiveButton("Сохранить") { _, _ ->
+                val v = et.text.toString().trim()
+                if (v.isNotEmpty()) prefs.edit().putString("model", v).apply()
+            }
+            .setNegativeButton("Отмена", null).show()
     }
 
     // ---------- dictation ----------
@@ -672,7 +907,7 @@ class MainActivity : Activity() {
             return
         }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            Toast.makeText(this, "Служба распознавания речи недоступна", Toast.LENGTH_LONG).show()
+            toast("Служба распознавания речи недоступна")
             return
         }
         recognizer?.destroy()
@@ -685,7 +920,7 @@ class MainActivity : Activity() {
                 override fun onEndOfSpeech() {}
                 override fun onError(error: Int) {
                     finishDictation()
-                    Toast.makeText(this@MainActivity, "Ошибка диктовки: $error", Toast.LENGTH_SHORT).show()
+                    toast("Ошибка диктовки: $error")
                 }
 
                 override fun onResults(results: Bundle?) {
@@ -717,7 +952,7 @@ class MainActivity : Activity() {
         recognizer = null
     }
 
-    // ---------- lifecycle plumbing ----------
+    // ---------- lifecycle ----------
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
@@ -726,32 +961,27 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 1001) {
-            fileChooser?.onReceiveValue(if (resultCode == RESULT_OK) WebChromeClient.FileChooserParams.parseResult(resultCode, data) else null)
-            fileChooser = null
-        } else if (requestCode == 1002 && resultCode == RESULT_OK) {
-            data?.data?.let { handlePicked(it) }
+        if (requestCode == 3001 && resultCode == RESULT_OK) {
+            val rt = data?.getStringExtra("refresh")
+            if (!rt.isNullOrEmpty()) doLogin(rt)
         }
     }
 
-    override fun onSaveInstanceState(outState: Bundle) {
-        web.saveState(outState)
-        super.onSaveInstanceState(outState)
+    override fun onResume() {
+        super.onResume()
+        if ((streaming || running) && curId != null) startPolling()
     }
 
     @Deprecated("Legacy back handling")
     override fun onBackPressed() {
-        if (pageMode) {
-            if (web.canGoBack()) web.goBack() else showPage(false)
-        } else {
-            super.onBackPressed()
-        }
+        if (drawer.isDrawerOpen(Gravity.START)) drawer.closeDrawers() else super.onBackPressed()
     }
 
     override fun onDestroy() {
-        ui.removeCallbacks(poll)
+        ui.removeCallbacksAndMessages(null)
+        api.cancelStream()
         recognizer?.destroy()
-        web.destroy()
+        pool.shutdownNow()
         super.onDestroy()
     }
 }
