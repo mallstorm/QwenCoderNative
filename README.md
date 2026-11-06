@@ -1,18 +1,15 @@
-# Qwen Coder Native v1.3
+# Qwen Coder Native v2.0
 
-Android 8+ Qwen Coder wrapper.
+Нативный Android-клиент (чат как в Claude / ChatGPT) для Qwen Coder (`https://coder.qwen.ai/`).
 
-## Native mode (default)
-- Full-screen content area (no browser address bar), forced landscape.
-- Desktop User-Agent, wide CSS viewport, pinch zoom.
-- Native drag-to-position microphone with Android SpeechRecognizer (Russian).
-- In-app files, browser history, progress, persistent WebView cookies.
-- Prefer **Email + verification code** in `https://coder.qwen.ai/auth` if Qwen permits sign-in.
+## Как устроено
+- Нативный чат: пузыри сообщений, Markdown и блоки кода с копированием, поле ввода, голосовой ввод (ru-RU), прикрепление файлов, остановка генерации.
+- Сам coder.qwen.ai работает в скрытом WebView (десктопный UA, общие cookies). Нативный слой через JS-мост (`assets/qc_bridge.js`) читает диалог со страницы, вставляет текст в поле ввода и нажимает «отправить»/«стоп».
+- Кнопка «Страница Qwen» показывает настоящую страницу: вход, подключение Git-репозитория, настройки.
 
-## Google login
-- Native WebView and Chrome use isolated cookie jars. Google OAuth initiated in a WebView may fail (`Invalid origin`).
-- Select **Open Chrome** from the in-app menu to use Google's already-working Chrome session.
-- The Chrome window's orientation, desktop mode, and toolbar are controlled by Chrome, not by the native Activity.
-- The Android app cannot carry Qwen login cookies from Chrome into WebView, and cannot remove the Chrome toolbar without website ownership and verified TWA.
+## Вход
+- Предпочтительно email + код подтверждения (`/auth`).
+- Google OAuth в WebView может блокироваться, поэтому есть открытие в Chrome (сессия Chrome в WebView не переносится).
 
-This is intentionally a dual-mode app: Native desktop UI with email authentication, or secure Chrome login. It does not claim Google OAuth works in the embedded WebView.
+## Настройка под вёрстку Qwen
+Если сообщения или кнопки определяются неверно: меню → «Диагностика страницы» (копирует структуру DOM) или «Селекторы элементов» (свои CSS-селекторы сообщений, поля ввода, кнопок отправки и остановки).
