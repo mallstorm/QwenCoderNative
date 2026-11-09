@@ -27,7 +27,7 @@ data class Step(
     val id: String, val type: String, val action: String, val log: String, val status: String,
     val args: String = "", val tool: String = ""
 )
-data class FileChange(val path: String, val command: String, val oldText: String, val newText: String, val pending: Boolean = false)
+data class FileChange(val path: String, val command: String, val oldText: String, val newText: String, val pending: Boolean = false, val full: Boolean = true)
 data class Usage(val remaining: Int, val status: String, val member: String, val resetAt: Long)
 data class ChatMsg(
     val id: String, val role: String, val text: String, val steps: List<Step>,
@@ -305,21 +305,55 @@ class Api(ctx: Context) {
         null
     }
 
-    /** Edits that are still in progress (tool call args are known before the server reports file_list). */
+    private class VFile(val path: String) {
+        var base: String? = null
+        var cur: String? = null
+        val oldH = StringBuilder()
+        val newH = StringBuilder()
+    }
+
+    private fun arg(a: JSONObject, vararg keys: String): String? {
+        for (k in keys) if (a.has(k) && !a.isNull(k)) return a.optString(k)
+        return null
+    }
+
+    fun normPath(p: String): String = p.removePrefix("/workspace/").removePrefix("./")
+
+    /** Rebuilds file changes from the agent's tool-call arguments (used when the server sends no file_list). */
     fun changesFromSteps(steps: Collection<Step>): List<FileChange> {
-        val out = ArrayList<FileChange>()
+        val map = LinkedHashMap<String, VFile>()
         for (s in steps) {
             if (s.args.isEmpty()) continue
             try {
                 val a = JSONObject(s.args)
-                val path = a.optString("path")
+                val path = arg(a, "path", "file_path", "filepath", "filename", "file", "target_file") ?: continue
                 if (path.isEmpty()) continue
-                when (s.tool) {
-                    "create_file" -> out.add(FileChange(path, "create", "", a.optString("content"), true))
-                    "edit_file" -> out.add(FileChange(path, "patch", a.optString("context"), a.optString("replacement"), true))
+                val content = arg(a, "content", "file_text", "new_content", "contents", "text", "code")
+                val old = arg(a, "context", "old_str", "old_string", "old_text", "search", "old_content")
+                val new = arg(a, "replacement", "new_str", "new_string", "new_text", "replace")
+                if (content == null && new == null) continue
+                val v = map.getOrPut(normPath(path)) { VFile(normPath(path)) }
+                if (new == null || old.isNullOrEmpty()) {
+                    if (v.cur == null && v.base == null) v.base = ""
+                    v.cur = new ?: content
+                } else {
+                    val c = v.cur
+                    val at = c?.indexOf(old) ?: -1
+                    if (c != null && at >= 0) {
+                        v.cur = c.substring(0, at) + new + c.substring(at + old.length)
+                    } else {
+                        v.oldH.append(old).append("\n")
+                        v.newH.append(new).append("\n")
+                    }
                 }
             } catch (_: Exception) {
             }
+        }
+        val out = ArrayList<FileChange>()
+        for (v in map.values) {
+            val c = v.cur
+            if (c != null) out.add(FileChange(v.path, "modify", v.base.orEmpty(), c, false, true))
+            else if (v.newH.isNotEmpty()) out.add(FileChange(v.path, "patch", v.oldH.toString(), v.newH.toString(), false, false))
         }
         return out
     }

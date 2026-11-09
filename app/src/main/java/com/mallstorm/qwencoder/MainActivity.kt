@@ -1986,6 +1986,28 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun exportTask(id: String) {
+        pool.execute {
+            try {
+                val txt = api.taskDetail(id).toString(1)
+                val name = "qwen-task-${id.take(8)}.json"
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    val cv = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                        put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/json")
+                    }
+                    val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)!!
+                    contentResolver.openOutputStream(uri)!!.use { it.write(txt.toByteArray()) }
+                    ui.post { toast("Сохранено в Загрузки: $name") }
+                } else {
+                    ui.post { Md.copy(this, txt.take(300_000)) }
+                }
+            } catch (e: Exception) {
+                ui.post { toast("Не удалось сохранить: ${e.message}") }
+            }
+        }
+    }
+
     private fun showMenu() {
         val id = curId
         sheet("Qwen Coder") { box, dlg ->
@@ -2004,6 +2026,7 @@ class MainActivity : Activity() {
             if (id != null) {
                 item("Превью проекта", "Открыть в окне кода") { openCode(2) }
                 item("Открыть задачу на сайте") { openUrl("https://coder.qwen.ai/c/$id") }
+                item("Сохранить данные задачи", "Файл JSON в «Загрузки» для отладки") { exportTask(id) }
             }
             item("Репозитории и GitHub", "Подключить на сайте, список обновится сам") {
                 refreshEnvsOnResume = true

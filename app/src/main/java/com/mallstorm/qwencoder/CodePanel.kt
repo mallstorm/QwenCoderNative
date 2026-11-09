@@ -31,6 +31,10 @@ class CodePanel(
     private var tab = 0
     private var files: List<FileChange> = emptyList()
     private var shells: List<Step> = emptyList()
+    private var edits: List<Step> = emptyList()
+    @Volatile private var virtual: Map<String, String> = emptyMap()
+    private var localMode = false
+    private var modeView: TextView? = null
     private var taskId: String? = null
     private var commit = ""
     private var sig = ""
@@ -99,29 +103,35 @@ class CodePanel(
     fun update(id: String?, msgs: List<ChatMsg>, live: Collection<Step>) {
         val f = LinkedHashMap<String, FileChange>()
         val sh = LinkedHashMap<String, Step>()
+        val all = ArrayList<Step>()
         var cm = ""
         for (m in msgs) {
             if (m.role != "assistant") continue
             for (s in m.steps) {
                 if (s.type.equals("Shell", true)) sh[m.id + s.id] = s
+                all.add(s)
             }
-            for (c in m.files) f[c.path] = c
+            for (c in m.files) f[norm(c.path)] = c
             if (m.commit.isNotEmpty()) cm = m.commit
         }
-        // in-progress edits (known from tool-call args before the server reports file_list)
-        val last = msgs.lastOrNull()
-        val stepsNow = if (last != null && last.role == "assistant") last.steps else emptyList()
-        for (c in changes(stepsNow + live)) if (!f.containsKey(c.path)) f[c.path] = c
+        all.addAll(live)
+        // server sent no file_list for these: rebuild from tool-call arguments
+        for (c in changes(all)) if (!f.containsKey(norm(c.path))) f[norm(c.path)] = c
         files = f.values.toList()
         shells = sh.values.toList()
+        edits = all.filter { it.type.equals("Edit", true) && (it.action.startsWith("edit") || it.action.startsWith("create") || it.action.startsWith("write")) }
+        virtual = f.filter { it.value.full }.mapValues { it.value.newText }
         commit = cm
+        if (taskId != id) localMode = false
         taskId = id
-        val s = "$id|${files.size}|${files.sumOf { it.newText.length + it.oldText.length }}|${shells.size}|${shells.lastOrNull()?.log?.length}|${shells.lastOrNull()?.status}"
+        val s = "$id|${files.size}|${files.sumOf { it.newText.length + it.oldText.length }}|${shells.size}|${shells.lastOrNull()?.log?.length}|${shells.lastOrNull()?.status}|${edits.size}"
         if (s == sig) return
         sig = s
         titleView.text = if (files.isEmpty()) "Код" else "Код · ${files.size} ${if (files.size == 1) "файл" else "файлов"}"
-        if (active) render()
+        if (active && tab != 2) render()
     }
+
+    private fun norm(p: String) = p.removePrefix("/workspace/").removePrefix("./")
 
     fun setActive(on: Boolean) {
         active = on
@@ -166,7 +176,24 @@ class CodePanel(
             setPadding(dp(12), dp(12), dp(12), dp(24))
         }
         if (files.isEmpty()) {
-            box.addView(empty("Пока нет изменений.\nКогда агент поменяет файлы, их diff появится здесь."))
+            if (edits.isEmpty()) {
+                box.addView(empty("Пока нет изменений.\nКогда агент поменяет файлы, их diff появится здесь."))
+            } else {
+                box.addView(TextView(context).apply {
+                    text = "Агент менял файлы, но сервер не прислал их содержимое:"
+                    setTextColor(Theme.MUTED)
+                    textSize = 13f
+                    setPadding(dp(4), 0, 0, dp(10))
+                })
+                for (e in edits) box.addView(TextView(context).apply {
+                    text = e.action
+                    setTextColor(Theme.TEXT)
+                    typeface = Typeface.MONOSPACE
+                    textSize = 12.5f
+                    background = Md.round(Theme.SURFACE, 12, context, Theme.STROKE)
+                    setPadding(dp(12), dp(10), dp(12), dp(10))
+                }, LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+            }
         } else {
             var add = 0
             var del = 0
@@ -350,6 +377,35 @@ class CodePanel(
         scrollOf(box)
     }
 
+    private fun localIndex(): String? {
+        val keys = virtual.keys
+        return keys.firstOrNull { it == "index.html" } ?: keys.filter { it.endsWith("/index.html") }.minByOrNull { it.length }
+            ?: keys.firstOrNull { it.endsWith(".html") }
+    }
+
+    private fun mime(p: String) = when (p.substringAfterLast('.', "").lowercase()) {
+        "html", "htm" -> "text/html"
+        "css" -> "text/css"
+        "js", "mjs" -> "application/javascript"
+        "json" -> "application/json"
+        "svg" -> "image/svg+xml"
+        else -> "text/plain"
+    }
+
+    private fun messagePage(text: String) = "<html><body style='margin:0;background:#${String.format("%06x", Theme.BG and 0xFFFFFF)};color:#${String.format("%06x", Theme.MUTED and 0xFFFFFF)};font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center'><div style='padding:32px;font-size:15px;line-height:1.5'>$text</div></body></html>"
+
+    private fun showLocal(v: WebView) {
+        val idx = localIndex()
+        if (idx == null) {
+            modeView?.text = ""
+            v.loadDataWithBaseURL(null, messagePage("Превью недоступно.<br>В задаче не запущен веб-сервер, а HTML-файлов среди изменений нет.<br><br>Попросите агента: «запусти проект для превью»."), "text/html", "utf-8", null)
+        } else {
+            localMode = true
+            modeView?.text = "локально, из файлов задачи"
+            v.loadUrl("https://$LOCAL/$idx")
+        }
+    }
+
     private fun renderPreview() {
         val id = taskId
         body.removeAllViews()
@@ -368,15 +424,26 @@ class CodePanel(
             setTextColor(Theme.ACCENT)
             textSize = 13f
             setPadding(0, dp(6), dp(16), dp(6))
-            setOnClickListener { web?.reload() }
+            setOnClickListener {
+                localMode = false
+                modeView?.text = ""
+                web?.loadUrl(url)
+            }
         })
         bar.addView(TextView(context).apply {
             text = "В браузере"
             setTextColor(Theme.ACCENT)
             textSize = 13f
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(6), dp(16), dp(6))
             setOnClickListener { onOpenBrowser(url) }
         })
+        modeView = TextView(context).apply {
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            maxLines = 1
+            text = if (localMode) "локально, из файлов задачи" else ""
+        }
+        bar.addView(modeView, LayoutParams(0, -2, 1f))
         col.addView(bar, LayoutParams(-1, -2))
         if (web == null || webFor != id) {
             web?.destroy()
@@ -386,18 +453,42 @@ class CodePanel(
                 settings.domStorageEnabled = true
                 webViewClient = object : WebViewClient() {
                     override fun onReceivedHttpError(v: WebView, r: android.webkit.WebResourceRequest, e: android.webkit.WebResourceResponse) {
-                        if (r.isForMainFrame && e.statusCode >= 400) {
-                            v.loadDataWithBaseURL(null, "<html><body style='margin:0;background:#${String.format("%06x", Theme.BG and 0xFFFFFF)};color:#${String.format("%06x", Theme.MUTED and 0xFFFFFF)};font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center'><div style='padding:32px;font-size:15px;line-height:1.5'>Превью недоступно.<br>Агент пока не запустил веб-сервер в этой задаче.<br><br>Попросите его: «запусти проект для превью».</div></body></html>", "text/html", "utf-8", null)
+                        if (r.isForMainFrame && e.statusCode >= 400 && r.url.host != LOCAL) v.post { showLocal(v) }
+                    }
+
+                    override fun onReceivedError(v: WebView, r: android.webkit.WebResourceRequest, e: android.webkit.WebResourceError) {
+                        if (r.isForMainFrame && r.url.host != LOCAL) v.post { showLocal(v) }
+                    }
+
+                    override fun shouldInterceptRequest(v: WebView, r: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                        if (r.url.host != LOCAL) return null
+                        val path = (r.url.path ?: "").trimStart('/')
+                        val files = virtual
+                        val root = (localIndex() ?: "").substringBeforeLast('/', "")
+                        val key = files.keys.firstOrNull { it == path }
+                            ?: files.keys.firstOrNull { root.isNotEmpty() && it == "$root/$path" }
+                            ?: files.keys.firstOrNull { it.endsWith("/$path") }
+                        val data = if (key != null) files[key] else null
+                        return if (data != null) {
+                            android.webkit.WebResourceResponse(mime(key!!), "utf-8", java.io.ByteArrayInputStream(data.toByteArray()))
+                        } else {
+                            android.webkit.WebResourceResponse("text/plain", "utf-8", 404, "Not Found", HashMap(), java.io.ByteArrayInputStream(ByteArray(0)))
                         }
                     }
                 }
                 loadUrl(url)
             }
             webFor = id
+        } else if (localMode) {
+            web?.reload()
         }
         (web!!.parent as? android.view.ViewGroup)?.removeView(web)
         col.addView(web, LayoutParams(-1, 0, 1f))
         body.addView(col, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private companion object {
+        const val LOCAL = "local.preview"
     }
 
     fun destroy() {
