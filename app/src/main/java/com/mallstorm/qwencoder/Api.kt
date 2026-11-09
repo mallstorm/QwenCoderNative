@@ -379,8 +379,11 @@ class Api(ctx: Context) {
         if (logList == null) return
         for (i in 0 until logList.length()) {
             val l = logList.optJSONObject(i) ?: continue
+            val role = l.optString("role")
+            if (role.isNotEmpty() && role != "function") continue
             val id = l.optString("function_id").ifEmpty { "step$i" }
             val old = into[id]
+            if (old == null && l.optString("function_type").isEmpty()) continue
             val log = l.optString("log")
             into[id] = Step(
                 id,

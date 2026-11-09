@@ -510,6 +510,8 @@ class MainActivity : Activity() {
     private fun applyDetail(d: JSONObject) {
         thread = api.parseThread(d)
         leafId = thread.lastOrNull()?.id
+        val tail = thread.lastOrNull()
+        if (tail != null && tail.role == "assistant" && tail.done) running = false
         val title = d.optString("title")
         if (title.isNotEmpty() && title != "null") curTitle = title
         val info = d.optJSONObject("meta")?.optJSONObject("repo_info")
