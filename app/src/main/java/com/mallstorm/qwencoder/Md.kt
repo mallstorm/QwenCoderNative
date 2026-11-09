@@ -30,21 +30,52 @@ import android.widget.TextView
 import android.widget.Toast
 
 object Theme {
-    val BG = Color.rgb(13, 14, 19)
-    val SURFACE = Color.rgb(22, 24, 33)
-    val SURFACE2 = Color.rgb(30, 33, 45)
-    val STROKE = Color.rgb(42, 46, 61)
-    val TEXT = Color.rgb(232, 234, 240)
-    val MUTED = Color.rgb(138, 145, 163)
-    val ACCENT = Color.rgb(139, 92, 246)
-    val ACCENT2 = Color.rgb(59, 130, 246)
-    val USER1 = Color.rgb(104, 76, 222)
-    val USER2 = Color.rgb(54, 100, 220)
-    val GREEN = Color.rgb(74, 222, 128)
-    val AMBER = Color.rgb(251, 191, 36)
-    val RED = Color.rgb(248, 113, 113)
-    val CODE_BG = Color.rgb(10, 11, 15)
-    val CODE_INLINE = Color.rgb(40, 44, 60)
+    var mode = "dark"
+    var light = false
+    var BG = 0; var SURFACE = 0; var SURFACE2 = 0; var STROKE = 0; var TEXT = 0; var MUTED = 0
+    var ACCENT = 0; var ACCENT2 = 0; var USER1 = 0; var USER2 = 0
+    var GREEN = 0; var AMBER = 0; var RED = 0
+    var CODE_BG = 0; var CODE_INLINE = 0; var INLINE_FG = 0; var CODE_FG = 0
+    var ADD_FG = 0; var DEL_FG = 0; var RIPPLE = 0
+    var C_COMMENT = 0; var C_STRING = 0; var C_NUMBER = 0; var C_KEYWORD = 0
+
+    fun apply(m: String) {
+        mode = m
+        light = m != "dark"
+        fun c(r: Int, g: Int, b: Int) = Color.rgb(r, g, b)
+        when (m) {
+            "light" -> {
+                BG = c(250, 250, 252); SURFACE = c(255, 255, 255); SURFACE2 = c(238, 240, 246); STROKE = c(222, 226, 236)
+                TEXT = c(24, 27, 36); MUTED = c(104, 112, 130)
+                ACCENT = c(124, 77, 237); ACCENT2 = c(47, 123, 245); USER1 = ACCENT; USER2 = ACCENT2
+            }
+            "teal" -> {
+                BG = c(238, 250, 249); SURFACE = c(255, 255, 255); SURFACE2 = c(220, 242, 240); STROKE = c(190, 224, 221)
+                TEXT = c(14, 38, 42); MUTED = c(77, 118, 122)
+                ACCENT = c(13, 148, 136); ACCENT2 = c(8, 145, 178); USER1 = c(13, 148, 136); USER2 = c(8, 145, 178)
+            }
+            else -> {
+                BG = c(13, 14, 19); SURFACE = c(22, 24, 33); SURFACE2 = c(30, 33, 45); STROKE = c(42, 46, 61)
+                TEXT = c(232, 234, 240); MUTED = c(138, 145, 163)
+                ACCENT = c(139, 92, 246); ACCENT2 = c(59, 130, 246); USER1 = c(104, 76, 222); USER2 = c(54, 100, 220)
+            }
+        }
+        if (light) {
+            GREEN = c(22, 163, 74); AMBER = c(202, 138, 4); RED = c(220, 38, 38)
+            CODE_BG = c(243, 245, 249); CODE_INLINE = c(231, 235, 243); INLINE_FG = if (m == "teal") c(15, 118, 110) else c(109, 40, 217)
+            CODE_FG = c(40, 46, 60); ADD_FG = c(21, 101, 52); DEL_FG = c(153, 27, 27)
+            RIPPLE = Color.argb(34, 0, 0, 0)
+            C_COMMENT = c(100, 116, 139); C_STRING = c(21, 128, 61); C_NUMBER = c(194, 65, 12); C_KEYWORD = c(126, 34, 206)
+        } else {
+            GREEN = c(74, 222, 128); AMBER = c(251, 191, 36); RED = c(248, 113, 113)
+            CODE_BG = c(10, 11, 15); CODE_INLINE = c(40, 44, 60); INLINE_FG = c(196, 181, 253); CODE_FG = c(205, 210, 222)
+            ADD_FG = c(187, 247, 208); DEL_FG = c(254, 202, 202)
+            RIPPLE = Color.argb(40, 255, 255, 255)
+            C_COMMENT = c(108, 122, 144); C_STRING = c(165, 214, 167); C_NUMBER = c(247, 140, 108); C_KEYWORD = c(199, 146, 234)
+        }
+    }
+
+    init { apply("dark") }
 }
 
 object Md {
@@ -73,10 +104,10 @@ object Md {
         }
 
     fun rippleCircle(): Drawable =
-        RippleDrawable(ColorStateList.valueOf(Color.argb(48, 255, 255, 255)), null, circle(Color.WHITE))
+        RippleDrawable(ColorStateList.valueOf(Theme.RIPPLE), null, circle(Color.WHITE))
 
     fun rippleRect(content: Drawable?): Drawable =
-        RippleDrawable(ColorStateList.valueOf(Color.argb(36, 255, 255, 255)), content, GradientDrawable().apply { setColor(Color.WHITE) })
+        RippleDrawable(ColorStateList.valueOf(Theme.RIPPLE), content, GradientDrawable().apply { setColor(Color.WHITE) })
 
     fun logoView(ctx: Context, sizeDp: Int): ImageView = ImageView(ctx).apply {
         setImageResource(R.drawable.ic_logo)
@@ -277,7 +308,7 @@ object Md {
                     sb.append(g[1]!!.value)
                     sb.setSpan(TypefaceSpan("monospace"), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                     sb.setSpan(BackgroundColorSpan(Theme.CODE_INLINE), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    sb.setSpan(ForegroundColorSpan(Color.rgb(196, 181, 253)), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    sb.setSpan(ForegroundColorSpan(Theme.INLINE_FG), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                     sb.setSpan(RelativeSizeSpan(0.92f), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
                 g[2] != null -> {
@@ -316,10 +347,6 @@ object Md {
         "init", "constructor", "lateinit", "typealias", "namespace", "using", "func", "defer", "range", "echo"
     )
     private val HASH_LANGS = setOf("python", "py", "sh", "bash", "shell", "zsh", "yaml", "yml", "toml", "ruby", "rb", "dockerfile", "makefile", "ini", "conf", "r")
-    private val C_COMMENT = Color.rgb(108, 122, 144)
-    private val C_STRING = Color.rgb(165, 214, 167)
-    private val C_NUMBER = Color.rgb(247, 140, 108)
-    private val C_KEYWORD = Color.rgb(199, 146, 234)
 
     fun highlight(code: String, lang: String): CharSequence {
         val sb = SpannableStringBuilder(code)
@@ -328,10 +355,10 @@ object Md {
         val re = Regex("""($comment)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`[^`]*`)|\b(\d+(?:\.\d+)?)\b|\b([A-Za-z_][A-Za-z0-9_]*)\b""")
         for (m in re.findAll(code)) {
             val color = when {
-                m.groups[1] != null -> C_COMMENT
-                m.groups[2] != null -> C_STRING
-                m.groups[3] != null -> C_NUMBER
-                else -> if (m.groupValues[4] in KEYWORDS) C_KEYWORD else 0
+                m.groups[1] != null -> Theme.C_COMMENT
+                m.groups[2] != null -> Theme.C_STRING
+                m.groups[3] != null -> Theme.C_NUMBER
+                else -> if (m.groupValues[4] in KEYWORDS) Theme.C_KEYWORD else 0
             }
             if (color != 0) {
                 sb.setSpan(ForegroundColorSpan(color), m.range.first, m.range.last + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -377,7 +404,7 @@ object Md {
             text = highlight(code, lang)
             typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setTextColor(Color.rgb(214, 222, 235))
+            setTextColor(Theme.CODE_FG)
             setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 12))
             setTextIsSelectable(true)
         })

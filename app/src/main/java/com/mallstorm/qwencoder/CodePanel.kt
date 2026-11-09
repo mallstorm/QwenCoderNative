@@ -291,11 +291,11 @@ class CodePanel(
             when (l.kind) {
                 '+' -> {
                     sb.setSpan(BackgroundColorSpan(Color.argb(60, 74, 222, 128)), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    sb.setSpan(ForegroundColorSpan(Color.rgb(187, 247, 208)), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    sb.setSpan(ForegroundColorSpan(Theme.ADD_FG), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
                 '-' -> {
                     sb.setSpan(BackgroundColorSpan(Color.argb(60, 248, 113, 113)), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    sb.setSpan(ForegroundColorSpan(Color.rgb(254, 202, 202)), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    sb.setSpan(ForegroundColorSpan(Theme.DEL_FG), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
                 else -> sb.setSpan(ForegroundColorSpan(Theme.MUTED), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
@@ -332,7 +332,7 @@ class CodePanel(
                     sb.append("\n")
                     val a = sb.length
                     sb.append(if (out.length > 6000) out.take(6000) + "\n…" else out)
-                    sb.setSpan(ForegroundColorSpan(Color.rgb(205, 210, 222)), a, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    sb.setSpan(ForegroundColorSpan(Theme.CODE_FG), a, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 } else if (s.status != "finished") {
                     sb.append("\n…")
                 }

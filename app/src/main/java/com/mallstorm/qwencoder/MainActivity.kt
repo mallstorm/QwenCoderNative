@@ -6,6 +6,7 @@ import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -128,14 +129,26 @@ class MainActivity : Activity() {
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
     private fun lp(w: Int, h: Int, weight: Float = 0f) = LinearLayout.LayoutParams(w, h, weight)
 
+    override fun attachBaseContext(base: Context) {
+        val sc = base.getSharedPreferences("qc", MODE_PRIVATE).getInt("fs", 100) / 100f
+        val cfg = android.content.res.Configuration(base.resources.configuration)
+        cfg.fontScale = cfg.fontScale * sc
+        super.attachBaseContext(base.createConfigurationContext(cfg))
+    }
+
+    private fun dlgTheme() = if (Theme.light) android.R.style.Theme_Material_Light_NoActionBar else android.R.style.Theme_Material_NoActionBar
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        prefs = getSharedPreferences("qc", MODE_PRIVATE)
+        Theme.apply(prefs.getString("theme", "dark") ?: "dark")
+        setTheme(dlgTheme())
         super.onCreate(savedInstanceState)
         api = Api(this)
-        prefs = getSharedPreferences("qc", MODE_PRIVATE)
         selModel = prefs.getString("model", "qwen3-coder-plus") ?: "qwen3-coder-plus"
         thinking = prefs.getBoolean("think", false)
         window.statusBarColor = Theme.BG
         window.navigationBarColor = Theme.BG
+        if (Theme.light) window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 
         val root = FrameLayout(this).apply { setBackgroundColor(Theme.BG) }
@@ -147,6 +160,10 @@ class MainActivity : Activity() {
 
         if (api.loggedIn) showMain() else showLogin()
         handleIntent(intent)
+        if (intent?.getBooleanExtra("open_settings", false) == true) {
+            intent.removeExtra("open_settings")
+            ui.post { openSettings() }
+        }
     }
 
     // ---------- UI helpers ----------
@@ -609,52 +626,153 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun restartUi(openSettings: Boolean) {
+        val it = Intent(intent)
+        if (curId != null) it.putExtra("task_id", curId).putExtra("task_title", curTitle)
+        if (openSettings) it.putExtra("open_settings", true)
+        setIntent(it)
+        recreate()
+    }
+
     private fun openSettings() {
+        val dlg = Dialog(this, dlgTheme())
+        dlg.window?.setBackgroundDrawable(ColorDrawable(Theme.BG))
+        dlg.window?.statusBarColor = Theme.BG
+        dlg.window?.navigationBarColor = Theme.BG
+        dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        if (Theme.light) dlg.window?.decorView?.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Theme.BG) }
+        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(4), 0, dp(12), 0) }
+        bar.addView(icon(R.drawable.ic_back, "Назад") { dlg.dismiss() })
+        bar.addView(TextView(this).apply { text = "Настройки"; setTextColor(Theme.TEXT); textSize = 18f; typeface = Typeface.DEFAULT_BOLD }, lp(0, -2, 1f).apply { leftMargin = dp(6) })
+        root.addView(bar, lp(-1, dp(56)))
+        root.addView(View(this).apply { setBackgroundColor(Theme.STROKE) }, lp(-1, 1))
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(6), dp(16), dp(32)) }
+        root.addView(ScrollView(this).apply { addView(box) }, lp(-1, 0, 1f))
+
+        fun card(): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Md.round(Theme.SURFACE, 18, this@MainActivity, Theme.STROKE)
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+        }
+        fun label(t: String) = TextView(this).apply { text = t; setTextColor(Theme.MUTED); textSize = 12f; typeface = Typeface.DEFAULT_BOLD; setPadding(dp(4), dp(18), 0, dp(8)) }
+        fun editBg() = Md.round(Theme.SURFACE2, 12, this)
+        fun edit(value: String, multi: Boolean) = EditText(this).apply {
+            setText(value); setTextColor(Theme.TEXT); textSize = 14f
+            background = editBg(); setPadding(dp(12), dp(10), dp(12), dp(10))
+            if (multi) { minLines = 3; maxLines = 8; gravity = Gravity.TOP; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE }
+            else { setSingleLine(); inputType = InputType.TYPE_CLASS_TEXT }
+        }
+
+        box.addView(label("ОФОРМЛЕНИЕ"))
+        val themes = listOf(
+            Triple("dark", "Тёмная", Pair(Color.rgb(22, 24, 33), Color.rgb(139, 92, 246))),
+            Triple("light", "Белая", Pair(Color.WHITE, Color.rgb(124, 77, 237))),
+            Triple("teal", "Бирюзовая", Pair(Color.rgb(220, 242, 240), Color.rgb(13, 148, 136))))
+        val tr = LinearLayout(this)
+        for ((key, name, cols) in themes) {
+            val on = Theme.mode == key
+            val t = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                background = Md.rippleRect(Md.round(Theme.SURFACE, 16, this@MainActivity, if (on) Theme.ACCENT else Theme.STROKE))
+                setPadding(dp(6), dp(12), dp(6), dp(10))
+                setOnClickListener {
+                    if (!on) { prefs.edit().putString("theme", key).apply(); dlg.dismiss(); restartUi(true) }
+                }
+            }
+            t.addView(View(this).apply {
+                background = Md.circle(cols.first).also { it.setStroke(dp(3), cols.second) }
+            }, lp(dp(44), dp(44)))
+            t.addView(TextView(this).apply { text = name; setTextColor(Theme.TEXT); textSize = 12.5f; setPadding(0, dp(8), 0, 0); typeface = if (on) Typeface.DEFAULT_BOLD else Typeface.DEFAULT })
+            tr.addView(t, lp(0, -2, 1f).apply { if (key != "dark") leftMargin = dp(8) })
+        }
+        box.addView(tr, lp(-1, -2))
+
+        box.addView(label("РАЗМЕР ТЕКСТА"))
+        val fc = card()
+        val cur = prefs.getInt("fs", 100)
+        val fl = TextView(this).apply { setTextColor(Theme.TEXT); textSize = 14f; text = "Масштаб: $cur%" }
+        fc.addView(fl)
+        val sb = android.widget.SeekBar(this).apply {
+            max = 12
+            progress = (cur - 70) / 5
+            progressTintList = ColorStateList.valueOf(Theme.ACCENT)
+            thumbTintList = ColorStateList.valueOf(Theme.ACCENT)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, u: Boolean) { fl.text = "Масштаб: ${70 + p * 5}%" }
+                override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(s: android.widget.SeekBar?) {
+                    val v = 70 + (s?.progress ?: 6) * 5
+                    if (v != cur) { prefs.edit().putInt("fs", v).apply(); dlg.dismiss(); restartUi(true) }
+                }
+            })
+        }
+        fc.addView(sb, lp(-1, -2).apply { topMargin = dp(6) })
+        val ends = LinearLayout(this)
+        ends.addView(TextView(this).apply { text = "70%"; setTextColor(Theme.MUTED); textSize = 11f }, lp(0, -2, 1f))
+        ends.addView(TextView(this).apply { text = "130%"; setTextColor(Theme.MUTED); textSize = 11f })
+        fc.addView(ends, lp(-1, -2))
+        box.addView(fc, lp(-1, -2))
+
+        box.addView(label("QWEN CODER"))
+        val qc = card()
+        val status = TextView(this).apply { text = "Загрузка настроек…"; setTextColor(Theme.MUTED); textSize = 13f }
+        qc.addView(status)
+        box.addView(qc, lp(-1, -2))
+        dlg.setContentView(root)
+        dlg.show()
+
         pool.execute {
             try {
                 val st = api.getSettings()
-                ui.post { settingsDialog(st) }
-            } catch (e: Exception) {
-                ui.post { handleError(e) }
-            }
-        }
-    }
-
-    private fun settingsDialog(st: JSONObject) {
-        val cs = st.optJSONObject("code_settings") ?: JSONObject()
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
-        }
-        fun field(label: String, value: String, multi: Boolean): EditText {
-            box.addView(TextView(this).apply { text = label; textSize = 12f; setPadding(0, dp(10), 0, dp(2)) })
-            val e = EditText(this).apply {
-                setText(value)
-                textSize = 14f
-                if (multi) { minLines = 3; maxLines = 8; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE }
-            }
-            box.addView(e, lp(-1, -2))
-            return e
-        }
-        val prompt = field("Свой промпт для кода", cs.optString("custom_prompt"), true)
-        val branch = field("Формат имени ветки", cs.optString("branch_format"), false)
-        val diff = field("Вид diff (unified / split)", cs.optString("diff_display", "unified"), false)
-        AlertDialog.Builder(this).setTitle("Настройки Qwen Coder").setView(ScrollView(this).apply { addView(box) })
-            .setPositiveButton("Сохранить") { _, _ ->
-                cs.put("custom_prompt", prompt.text.toString())
-                cs.put("branch_format", branch.text.toString())
-                cs.put("diff_display", diff.text.toString().trim().ifEmpty { "unified" })
-                st.put("code_settings", cs)
-                pool.execute {
-                    try {
-                        api.updateSettings(st)
-                        ui.post { toast("Настройки сохранены") }
-                    } catch (e: Exception) {
-                        ui.post { handleError(e) }
+                ui.post {
+                    val cs = st.optJSONObject("code_settings") ?: JSONObject()
+                    qc.removeAllViews()
+                    fun cap(t: String) = TextView(this).apply { text = t; setTextColor(Theme.MUTED); textSize = 12f; setPadding(dp(2), dp(10), 0, dp(4)) }
+                    qc.addView(cap("Свой промпт для кода").apply { setPadding(dp(2), 0, 0, dp(4)) })
+                    val prompt = edit(cs.optString("custom_prompt"), true)
+                    qc.addView(prompt, lp(-1, -2))
+                    qc.addView(cap("Формат имени ветки"))
+                    val branch = edit(cs.optString("branch_format"), false)
+                    qc.addView(branch, lp(-1, -2))
+                    qc.addView(cap("Вид diff"))
+                    var diff = cs.optString("diff_display", "unified").ifEmpty { "unified" }
+                    val dr = LinearLayout(this)
+                    val dv = ArrayList<Pair<String, TextView>>()
+                    fun paint() {
+                        for ((k, v) in dv) {
+                            val on = k == diff
+                            v.setTextColor(if (on) Color.WHITE else Theme.TEXT)
+                            v.background = if (on) Md.gradient(this, Theme.ACCENT, Theme.ACCENT2, 12) else editBg()
+                        }
                     }
+                    for ((k, n) in listOf("unified" to "Единый", "split" to "Раздельный")) {
+                        val v = TextView(this).apply { text = n; textSize = 13.5f; gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); setOnClickListener { diff = k; paint() } }
+                        dv.add(k to v)
+                        dr.addView(v, lp(0, -2, 1f).apply { if (k == "split") leftMargin = dp(8) })
+                    }
+                    paint()
+                    qc.addView(dr, lp(-1, -2))
+                    qc.addView(gradientButton("Сохранить") {
+                        cs.put("custom_prompt", prompt.text.toString())
+                        cs.put("branch_format", branch.text.toString())
+                        cs.put("diff_display", diff)
+                        st.put("code_settings", cs)
+                        pool.execute {
+                            try {
+                                api.updateSettings(st)
+                                ui.post { toast("Настройки сохранены") }
+                            } catch (e: Exception) {
+                                ui.post { handleError(e) }
+                            }
+                        }
+                    }, lp(-1, -2).apply { topMargin = dp(16) })
                 }
+            } catch (e: Exception) {
+                ui.post { status.text = "Не удалось загрузить настройки Qwen Coder: ${e.message ?: ""}" }
             }
-            .setNegativeButton("Отмена", null).show()
+        }
     }
 
     private fun handleIntent(i: Intent?) {
@@ -876,7 +994,7 @@ class MainActivity : Activity() {
             toast("Репозиторий открытой задачи изменить нельзя. Создайте новую задачу (+)")
             return
         }
-        val dlg = Dialog(this, android.R.style.Theme_Material_NoActionBar)
+        val dlg = Dialog(this, dlgTheme())
         dlg.window?.setBackgroundDrawable(ColorDrawable(Theme.BG))
         dlg.window?.statusBarColor = Theme.BG
         dlg.window?.navigationBarColor = Theme.BG
@@ -1113,22 +1231,62 @@ class MainActivity : Activity() {
     // ---------- models ----------
 
     private fun openModelPicker() {
-        val titles = ArrayList<String>()
-        for (m in models) titles.add((if (m.id == selModel) "✓  " else "     ") + m.title + "  ·  " + m.hint)
-        val custom = models.none { it.id == selModel }
-        if (custom) titles.add("✓  $selModel  ·  свой ID")
-        titles.add("Указать ID модели вручную…")
-        AlertDialog.Builder(this)
-            .setTitle("Модель")
-            .setItems(titles.toTypedArray()) { _, which ->
-                if (which < models.size) {
-                    setModel(models[which].id)
-                } else if (custom && which == models.size) {
-                    // current custom model is already selected
-                } else {
-                    askCustomModel()
+        sheet("Модель") { box, dlg ->
+            val custom = models.none { it.id == selModel }
+            fun card(title: String, sub: String, selected: Boolean, onClick: () -> Unit) {
+                val row = LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = Md.rippleRect(Md.round(if (selected) Theme.SURFACE2 else Theme.SURFACE, 16, this@MainActivity, if (selected) Theme.ACCENT else Theme.STROKE))
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    setOnClickListener { dlg.dismiss(); onClick() }
                 }
-            }.show()
+                row.addView(Md.logoView(this, 34), lp(dp(34), dp(34)))
+                val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                tb.addView(TextView(this).apply { text = title; setTextColor(Theme.TEXT); textSize = 15.5f; typeface = Typeface.DEFAULT_BOLD })
+                tb.addView(TextView(this).apply { text = sub; setTextColor(Theme.MUTED); textSize = 12.5f })
+                row.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+                if (selected) row.addView(ImageView(this).apply {
+                    setImageResource(R.drawable.ic_check)
+                    setColorFilter(Color.WHITE)
+                    background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+                    setPadding(dp(5), dp(5), dp(5), dp(5))
+                }, lp(dp(24), dp(24)))
+                box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            for (m in models) card(m.title, m.hint, m.id == selModel) { setModel(m.id) }
+            if (custom) card(selModel, "Свой ID модели", true) {}
+            card("Свой ID…", "Указать идентификатор модели вручную", false) { askCustomModel() }
+        }
+    }
+
+    /** Bottom sheet with rounded top, built in code. */
+    private fun sheet(title: String, build: (LinearLayout, Dialog) -> Unit): Dialog {
+        val d = Dialog(this)
+        d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(10), dp(16), dp(24))
+        }
+        box.addView(View(this).apply { background = Md.round(Theme.STROKE, 3, this@MainActivity) }, lp(dp(40), dp(4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(12) })
+        if (title.isNotEmpty()) box.addView(TextView(this).apply {
+            text = title; setTextColor(Theme.TEXT); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(4), 0, 0, dp(12))
+        })
+        build(box, d)
+        val r = dp(24).toFloat()
+        val bg = android.graphics.drawable.GradientDrawable().apply {
+            setColor(Theme.BG)
+            cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        }
+        d.setContentView(ScrollView(this).apply { background = bg; addView(box) })
+        d.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setLayout(-1, -2)
+            setGravity(Gravity.BOTTOM)
+            setDimAmount(0.55f)
+        }
+        d.show()
+        return d
     }
 
     private fun askCustomModel() {
@@ -1657,7 +1815,7 @@ class MainActivity : Activity() {
                 text = if (s.log.length > 6000) s.log.take(6000) + "\n…" else s.log.ifEmpty { "(нет вывода)" }
                 typeface = Typeface.MONOSPACE
                 textSize = 11.5f
-                setTextColor(Color.rgb(190, 200, 215))
+                setTextColor(Theme.CODE_FG)
                 setTextIsSelectable(true)
                 background = Md.round(Theme.CODE_BG, 8, this@MainActivity)
                 setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -1830,28 +1988,36 @@ class MainActivity : Activity() {
 
     private fun showMenu() {
         val id = curId
-        val items = ArrayList<Pair<String, () -> Unit>>()
-        if (id != null) {
-            items.add("Открыть превью проекта" to { openUrl("https://$id.preview.qwenlm.io/") })
-            items.add("Открыть задачу на сайте" to { openUrl("https://coder.qwen.ai/c/$id") })
+        sheet("Qwen Coder") { box, dlg ->
+            fun item(t: String, sub: String = "", color: Int = Theme.TEXT, a: () -> Unit) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = Md.rippleRect(Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE))
+                    setPadding(dp(16), dp(12), dp(16), dp(12))
+                    setOnClickListener { dlg.dismiss(); a() }
+                }
+                row.addView(TextView(this).apply { text = t; setTextColor(color); textSize = 15.5f })
+                if (sub.isNotEmpty()) row.addView(TextView(this).apply { text = sub; setTextColor(Theme.MUTED); textSize = 12.5f })
+                box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            item("Настройки", "Тема, размер текста, настройки Qwen Coder") { openSettings() }
+            if (id != null) {
+                item("Превью проекта", "Открыть в окне кода") { openCode(2) }
+                item("Открыть задачу на сайте") { openUrl("https://coder.qwen.ai/c/$id") }
+            }
+            item("Репозитории и GitHub", "Подключить на сайте, список обновится сам") {
+                refreshEnvsOnResume = true
+                openUrl("https://coder.qwen.ai/")
+            }
+            item("Обновить всё") {
+                envs = null
+                loadEnvs(true)
+                loadTasks()
+                loadUsage()
+                if (id != null) fetchDetail(id)
+            }
+            item("Выйти", "", Theme.RED) { logout() }
         }
-        items.add("Настройки Qwen Coder" to { openSettings() })
-        items.add("Репозитории и GitHub (сайт)" to {
-            refreshEnvsOnResume = true
-            openUrl("https://coder.qwen.ai/")
-        })
-        items.add("Обновить всё" to {
-            envs = null
-            loadEnvs(true)
-            loadTasks()
-            loadUsage()
-            if (id != null) fetchDetail(id)
-        })
-        items.add("Выйти" to { logout() })
-        AlertDialog.Builder(this)
-            .setTitle("Qwen Coder")
-            .setItems(items.map { it.first }.toTypedArray()) { _, which -> items[which].second() }
-            .show()
     }
 
     // ---------- dictation ----------
