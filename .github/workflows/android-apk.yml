@@ -17,16 +17,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build APK
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Build signed release APK
+        run: gradle --no-daemon :app:assembleRelease
+      - name: Verify signature
+        run: |
+          APKSIGNER=$(ls $ANDROID_HOME/build-tools/*/apksigner | tail -1)
+          $APKSIGNER verify --print-certs app/build/outputs/apk/release/app-release.apk | head -5
       - uses: actions/upload-artifact@v4
         with:
           name: QwenCoderNative-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
       - name: Publish APK as GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk QwenCoderNative.apk
-          gh release create "build-${{ github.run_number }}" QwenCoderNative.apk --title "QwenCoderNative build ${{ github.run_number }}" --notes "Debug APK, commit ${{ github.sha }}"
+          cp app/build/outputs/apk/release/app-release.apk QwenCoderNative.apk
+          gh release create "build-${{ github.run_number }}" QwenCoderNative.apk --title "QwenCoderNative build ${{ github.run_number }}" --notes "Signed release APK (constant signing key, installs over previous builds), commit ${{ github.sha }}"

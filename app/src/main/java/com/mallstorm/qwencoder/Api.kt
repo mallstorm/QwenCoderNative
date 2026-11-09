@@ -15,7 +15,10 @@ import java.util.UUID
 
 class ApiError(val code: String, message: String, val http: Int = 0) : Exception(message)
 
-data class Env(val id: String, val name: String, val repo: String, val branches: List<String>)
+data class Env(
+    val id: String, val name: String, val repo: String, val branches: List<String>,
+    val isPrivate: Boolean = false, val pushed: String = "", val description: String = ""
+)
 data class TaskItem(
     val id: String, val title: String, val status: String, val updatedAt: Long,
     val repo: String, val branch: String
@@ -240,15 +243,35 @@ class Api(ctx: Context) {
         val d = call("GET", "$CODER/coder/api/v2/environments/?page_num=1&page_size=50").optJSONObject("data")
         val arr = d?.optJSONArray("environments") ?: return emptyList()
         val out = ArrayList<Env>()
-        for (i in 0 until arr.length()) {
-            val e = arr.getJSONObject(i)
-            val info = e.optJSONObject("meta")?.optJSONObject("repo_info")
-            val bs = ArrayList<String>()
-            val ba = info?.optJSONArray("branches")
-            if (ba != null) for (k in 0 until ba.length()) bs.add(ba.getJSONObject(k).optString("name"))
-            out.add(Env(e.optString("id"), e.optString("name"), e.optString("repo_name"), bs))
-        }
+        for (i in 0 until arr.length()) out.add(parseEnv(arr.getJSONObject(i)))
         return out
+    }
+
+    private fun parseEnv(e: JSONObject): Env {
+        val info = e.optJSONObject("meta")?.optJSONObject("repo_info")
+        val bs = ArrayList<String>()
+        val ba = info?.optJSONArray("branches")
+        if (ba != null) for (k in 0 until ba.length()) bs.add(ba.getJSONObject(k).optString("name"))
+        return Env(
+            e.optString("id"), e.optString("name"), e.optString("repo_name"), bs,
+            info?.optBoolean("private") ?: false,
+            info?.optString("pushed_at").orEmpty(),
+            info?.optString("description").orEmpty().let { if (it == "null") "" else it }
+        )
+    }
+
+    /** Fresh data for one repository (up-to-date branch list). */
+    fun environment(id: String): Env {
+        val d = call("GET", "$CODER/coder/api/v2/environments/$id").optJSONObject("data") ?: throw ApiError("parse", "Пустой ответ")
+        return parseEnv(d)
+    }
+
+    /** Whether the Qwen account has a GitHub connection ("connected"), null if unknown. */
+    fun githubConnected(): Boolean? = try {
+        call("GET", "$CODER/coder/api/v2/github/connection_status").optJSONObject("data")
+            ?.optString("connection_status")?.let { it == "connected" }
+    } catch (_: Exception) {
+        null
     }
 
     private fun parseTask(t: JSONObject): TaskItem {

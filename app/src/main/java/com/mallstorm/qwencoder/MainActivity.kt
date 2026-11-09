@@ -1,13 +1,18 @@
 package com.mallstorm.qwencoder
 
 import android.Manifest
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -15,25 +20,28 @@ import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
-import android.view.inputmethod.InputMethodManager
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.drawerlayout.widget.DrawerLayout
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
 
 /** Native Qwen Coder client: talks to coder.qwen.ai's REST/SSE API directly (no WebView chat). */
@@ -45,26 +53,44 @@ class MainActivity : Activity() {
         var error: String? = null
     }
 
+    private data class ModelInfo(val id: String, val title: String, val hint: String)
+
+    private val models = listOf(
+        ModelInfo("qwen3-coder-plus", "Qwen3-Coder", "Основная модель для кода"),
+        ModelInfo("qwen3.8-max", "Qwen 3.8 Max", "Самая сильная"),
+        ModelInfo("qwen3.8-flash", "Qwen 3.8 Flash", "Быстрая и лёгкая")
+    )
+
     private lateinit var api: Api
     private lateinit var prefs: SharedPreferences
     private val ui = Handler(Looper.getMainLooper())
     private val pool = Executors.newCachedThreadPool()
 
-    private lateinit var loginView: LinearLayout
+    private lateinit var loginView: View
     private lateinit var tokenInput: EditText
     private lateinit var loginStatus: TextView
     private lateinit var drawer: DrawerLayout
     private lateinit var taskBox: LinearLayout
-    private lateinit var accountView: TextView
+    private lateinit var nameView: TextView
+    private lateinit var emailView: TextView
+    private lateinit var avatarView: TextView
     private lateinit var titleView: TextView
     private lateinit var subtitleView: TextView
+    private lateinit var statusDot: View
     private lateinit var scroll: ScrollView
     private lateinit var list: LinearLayout
-    private lateinit var emptyView: TextView
+    private lateinit var emptyBox: LinearLayout
+    private lateinit var emptyTitle: TextView
+    private lateinit var emptySub: TextView
+    private lateinit var chipsBox: LinearLayout
+    private lateinit var fab: ImageButton
+    private lateinit var repoChip: TextView
+    private lateinit var modelChip: TextView
     private lateinit var input: EditText
     private lateinit var sendBtn: ImageButton
     private lateinit var micBtn: ImageButton
 
+    private var statusAnim: ObjectAnimator? = null
     private var curId: String? = null
     private var curTitle = ""
     private var curRepo = ""
@@ -79,19 +105,25 @@ class MainActivity : Activity() {
     private var shown: List<ChatMsg> = emptyList()
     private var envs: List<Env>? = null
     private var tasks: List<TaskItem> = emptyList()
-    private val expanded = HashSet<String>()
+    private var selEnv: Env? = null
+    private var selBranch = ""
+    private var selModel = "qwen3-coder-plus"
+    private var refreshEnvsOnResume = false
+    private val openSteps = HashSet<String>()
+    private val cardToggled = HashSet<String>()
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
 
     private fun dp(v: Int) = Md.dp(this, v)
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
-    private fun model(): String = prefs.getString("model", "qwen3-coder-plus") ?: "qwen3-coder-plus"
+    private fun lp(w: Int, h: Int, weight: Float = 0f) = LinearLayout.LayoutParams(w, h, weight)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         api = Api(this)
         prefs = getSharedPreferences("qc", MODE_PRIVATE)
-        window.statusBarColor = Theme.SURFACE
+        selModel = prefs.getString("model", "qwen3-coder-plus") ?: "qwen3-coder-plus"
+        window.statusBarColor = Theme.BG
         window.navigationBarColor = Theme.BG
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 
@@ -105,215 +137,441 @@ class MainActivity : Activity() {
         if (api.loggedIn) showMain() else showLogin()
     }
 
-    // ---------- UI construction ----------
+    // ---------- UI helpers ----------
 
-    private fun pill(text: String, filled: Boolean, onClick: () -> Unit) = TextView(this).apply {
+    private fun icon(res: Int, desc: String, tint: Int = Theme.TEXT, onClick: () -> Unit) = ImageButton(this).apply {
+        setImageResource(res)
+        setColorFilter(tint)
+        contentDescription = desc
+        background = Md.rippleCircle()
+        scaleType = ImageView.ScaleType.CENTER_INSIDE
+        setPadding(dp(11), dp(11), dp(11), dp(11))
+        layoutParams = lp(dp(44), dp(44))
+        setOnClickListener { onClick() }
+    }
+
+    private fun gradientButton(text: String, onClick: () -> Unit) = TextView(this).apply {
         this.text = text
         setTextColor(Color.WHITE)
         textSize = 15f
+        typeface = Typeface.DEFAULT_BOLD
         gravity = Gravity.CENTER
-        background = Md.round(if (filled) Theme.ACCENT else Theme.SURFACE, 22, this@MainActivity)
-        setPadding(dp(18), dp(12), dp(18), dp(12))
+        background = Md.gradient(this@MainActivity, Theme.ACCENT, Theme.ACCENT2, 16)
+        setPadding(dp(18), dp(14), dp(18), dp(14))
         setOnClickListener { onClick() }
     }
 
-    private fun iconBtn(res: Int, desc: String, onClick: () -> Unit) = ImageButton(this).apply {
-        setImageResource(res)
-        setColorFilter(Color.WHITE)
-        contentDescription = desc
-        setBackgroundColor(Color.TRANSPARENT)
-        layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
+    private fun outlineButton(text: String, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        setTextColor(Theme.TEXT)
+        textSize = 14f
+        gravity = Gravity.CENTER
+        background = Md.round(Theme.SURFACE, 16, this@MainActivity, Theme.STROKE)
+        setPadding(dp(18), dp(13), dp(18), dp(13))
         setOnClickListener { onClick() }
     }
 
-    private fun buildLogin(): LinearLayout {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
+    private fun chip(text: String, iconRes: Int, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        setTextColor(Theme.TEXT)
+        textSize = 12.5f
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+        gravity = Gravity.CENTER_VERTICAL
+        compoundDrawablePadding = dp(6)
+        setCompoundDrawablesRelativeWithIntrinsicBounds(iconRes, 0, 0, 0)
+        compoundDrawableTintList = ColorStateList.valueOf(Theme.MUTED)
+        background = Md.round(Theme.SURFACE, 16, this@MainActivity, Theme.STROKE)
+        setPadding(dp(10), dp(7), dp(12), dp(7))
+        setOnClickListener { onClick() }
+    }
+
+    private fun sectionLabel(text: String) = TextView(this).apply {
+        this.text = text
+        setTextColor(Theme.MUTED)
+        textSize = 12f
+        typeface = Typeface.DEFAULT_BOLD
+        setPadding(dp(18), dp(14), dp(18), dp(6))
+    }
+
+    // ---------- UI construction ----------
+
+    private fun buildLogin(): View {
+        val sv = ScrollView(this).apply {
             setBackgroundColor(Theme.BG)
-            setPadding(dp(24), dp(24), dp(24), dp(24))
+            isFillViewport = true
             isClickable = true
         }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(56), dp(24), dp(28))
+        }
+        box.addView(Md.logoView(this, 84), lp(dp(84), dp(84)))
         box.addView(TextView(this).apply {
             text = "Qwen Coder"
             setTextColor(Theme.TEXT)
-            textSize = 26f
+            textSize = 28f
             typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(18), 0, dp(4))
         })
         box.addView(TextView(this).apply {
-            text = "Вставьте значение cookie refresh_token с coder.qwen.ai.\n\n" +
-                "Где взять: в Chrome на компьютере откройте coder.qwen.ai (вы уже вошли), F12 → Application → Cookies → .qwen.ai → refresh_token → скопируйте Value. " +
-                "Подойдёт и строка Cookie целиком, и JSON-экспорт расширения Cookie-Editor.\n\n" +
-                "Токен хранится только на этом телефоне."
+            text = "Нативный клиент для coder.qwen.ai"
             setTextColor(Theme.MUTED)
             textSize = 14f
-            setPadding(0, dp(12), 0, dp(12))
+            setPadding(0, 0, 0, dp(24))
         })
+        val steps = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Md.round(Theme.SURFACE, 16, this@MainActivity, Theme.STROKE)
+            setPadding(dp(16), dp(14), dp(16), dp(8))
+        }
+        val items = listOf(
+            "Откройте coder.qwen.ai в браузере на компьютере и войдите в аккаунт",
+            "F12 → Приложение → Файлы cookie → refresh_token",
+            "Скопируйте значение (Value) и вставьте ниже. Подойдёт и вся строка Cookie"
+        )
+        items.forEachIndexed { i, s ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 0, 0, dp(10))
+            }
+            row.addView(TextView(this).apply {
+                text = (i + 1).toString()
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+            }, lp(dp(22), dp(22)))
+            row.addView(TextView(this).apply {
+                text = s
+                setTextColor(Theme.TEXT)
+                textSize = 13.5f
+                setPadding(dp(12), 0, 0, 0)
+            }, lp(0, -2, 1f))
+            steps.addView(row)
+        }
+        box.addView(steps, lp(-1, -2))
         tokenInput = EditText(this).apply {
-            hint = "refresh_token"
+            hint = "Вставьте refresh_token"
             setHintTextColor(Theme.MUTED)
             setTextColor(Theme.TEXT)
             textSize = 13f
             typeface = Typeface.MONOSPACE
-            minLines = 4
-            maxLines = 8
+            minLines = 3
+            maxLines = 6
             gravity = Gravity.TOP
-            background = Md.round(Theme.SURFACE, 14, this@MainActivity)
+            background = Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE)
             setPadding(dp(14), dp(12), dp(14), dp(12))
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         }
-        box.addView(tokenInput, LinearLayout.LayoutParams(-1, -2))
+        box.addView(tokenInput, lp(-1, -2).apply { topMargin = dp(16) })
         loginStatus = TextView(this).apply {
-            setTextColor(Color.rgb(240, 170, 90))
+            setTextColor(Theme.AMBER)
             textSize = 13f
             setPadding(0, dp(10), 0, dp(10))
         }
-        box.addView(loginStatus)
-        box.addView(pill("Войти", true) { doLogin(tokenInput.text.toString()) }, LinearLayout.LayoutParams(-1, -2))
-        box.addView(pill("Войти через браузер приложения (email)", false) {
+        box.addView(loginStatus, lp(-1, -2))
+        box.addView(gradientButton("Войти") { doLogin(tokenInput.text.toString()) }, lp(-1, -2))
+        box.addView(outlineButton("Войти через встроенный браузер (email)") {
             startActivityForResult(Intent(this, WebLoginActivity::class.java), 3001)
-        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
-        return box
+        }, lp(-1, -2).apply { topMargin = dp(10) })
+        box.addView(TextView(this).apply {
+            text = "Токен хранится только на этом телефоне."
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, 0)
+        }, lp(-1, -2))
+        sv.addView(box, FrameLayout.LayoutParams(-1, -2))
+        return sv
     }
 
     private fun buildMain(): DrawerLayout {
         val dl = DrawerLayout(this)
+        dl.setScrimColor(Color.argb(150, 0, 0, 0))
 
-        // ----- content -----
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Theme.BG)
         }
+
+        // header
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Theme.SURFACE)
             setPadding(dp(4), 0, dp(4), 0)
         }
-        header.addView(iconBtn(android.R.drawable.ic_menu_agenda, "Задачи") { drawer.openDrawer(Gravity.START) })
+        header.addView(icon(R.drawable.ic_menu, "Задачи") { drawer.openDrawer(Gravity.START) })
+        header.addView(Md.logoView(this, 30), lp(dp(30), dp(30)).apply { leftMargin = dp(2) })
         val titleBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         titleView = TextView(this).apply {
-            text = "Qwen Coder"
             setTextColor(Theme.TEXT)
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
+        val subRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        statusDot = View(this)
+        subRow.addView(statusDot, lp(dp(7), dp(7)).apply { rightMargin = dp(6) })
         subtitleView = TextView(this).apply {
             setTextColor(Theme.MUTED)
             textSize = 12f
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
+        subRow.addView(subtitleView)
         titleBox.addView(titleView)
-        titleBox.addView(subtitleView)
-        header.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(4) })
-        header.addView(iconBtn(android.R.drawable.ic_menu_add, "Новая задача") { showNewTask(null) })
-        header.addView(iconBtn(android.R.drawable.ic_menu_more, "Меню") { showMenu() })
-        content.addView(header, LinearLayout.LayoutParams(-1, dp(56)))
+        titleBox.addView(subRow)
+        header.addView(titleBox, lp(0, -2, 1f).apply { leftMargin = dp(10) })
+        header.addView(icon(R.drawable.ic_add, "Новая задача") { startNewTask() })
+        header.addView(icon(R.drawable.ic_more, "Меню") { showMenu() })
+        content.addView(header, lp(-1, dp(56)))
+        content.addView(View(this).apply { setBackgroundColor(Theme.STROKE) }, lp(-1, 1))
 
+        // body
         val body = FrameLayout(this)
         list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(8))
+            setPadding(dp(16), dp(16), dp(16), dp(12))
         }
-        scroll = ScrollView(this).apply { addView(list, FrameLayout.LayoutParams(-1, -2)) }
+        scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            addView(list, FrameLayout.LayoutParams(-1, -2))
+        }
         body.addView(scroll, FrameLayout.LayoutParams(-1, -1))
-        emptyView = TextView(this).apply {
-            text = "Выберите задачу слева или создайте новую (+)."
-            setTextColor(Theme.MUTED)
-            textSize = 15f
-            gravity = Gravity.CENTER
-            setPadding(dp(32), 0, dp(32), 0)
+        emptyBox = buildEmpty()
+        body.addView(emptyBox, FrameLayout.LayoutParams(-1, -1))
+        fab = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_down)
+            setColorFilter(Theme.TEXT)
+            background = Md.circle(Theme.SURFACE2)
+            elevation = dp(4).toFloat()
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            visibility = View.GONE
+            setOnClickListener { scroll.post { scroll.smoothScrollTo(0, list.height) } }
         }
-        body.addView(emptyView, FrameLayout.LayoutParams(-1, -1))
-        content.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
+        body.addView(fab, FrameLayout.LayoutParams(dp(38), dp(38), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(10)
+        })
+        scroll.viewTreeObserver.addOnScrollChangedListener { updateFab() }
+        content.addView(body, lp(-1, 0, 1f))
 
+        // chips: repository + model
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), dp(4), dp(12), 0)
+        }
+        repoChip = chip("Без репозитория", R.drawable.ic_repo) { openRepoPicker() }
+        modelChip = chip("Qwen3-Coder", R.drawable.ic_sparkle) { openModelPicker() }
+        chipRow.addView(repoChip, lp(0, -2, 1f).apply { rightMargin = dp(8) })
+        chipRow.addView(modelChip, lp(-2, -2))
+        content.addView(chipRow, lp(-1, -2))
+
+        // composer
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(8), dp(10), dp(10))
+        }
         val composer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.BOTTOM
-            setPadding(dp(10), dp(6), dp(8), dp(8))
-            setBackgroundColor(Theme.BG)
+            background = Md.round(Theme.SURFACE, 26, this@MainActivity, Theme.STROKE)
+            setPadding(dp(18), dp(4), dp(5), dp(5))
         }
         input = EditText(this).apply {
-            hint = "Сообщение Qwen Coder"
+            hint = "Опишите задачу…"
             setHintTextColor(Theme.MUTED)
             setTextColor(Theme.TEXT)
             textSize = 16f
-            background = Md.round(Theme.SURFACE, 22, this@MainActivity)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(0, dp(9), 0, dp(9))
             maxLines = 6
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
-        composer.addView(input, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) })
-        micBtn = iconBtn(android.R.drawable.ic_btn_speak_now, "Голосовой ввод") { toggleDictation() }
-        composer.addView(micBtn)
+        composer.addView(input, lp(0, -2, 1f))
+        micBtn = icon(R.drawable.ic_mic, "Голосовой ввод", Theme.MUTED) { toggleDictation() }
+        composer.addView(micBtn, lp(dp(40), dp(40)))
         sendBtn = ImageButton(this).apply {
-            setImageResource(android.R.drawable.ic_menu_send)
+            setImageResource(R.drawable.ic_send)
             setColorFilter(Color.WHITE)
             contentDescription = "Отправить"
-            background = Md.round(Theme.ACCENT, 22, this@MainActivity)
+            background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(dp(9), dp(9), dp(9), dp(9))
             setOnClickListener { send() }
         }
-        composer.addView(sendBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(2) })
-        content.addView(composer, LinearLayout.LayoutParams(-1, -2))
+        composer.addView(sendBtn, lp(dp(40), dp(40)).apply { leftMargin = dp(2) })
+        wrap.addView(composer, lp(-1, -2))
+        content.addView(wrap, lp(-1, -2))
         dl.addView(content, DrawerLayout.LayoutParams(-1, -1))
 
-        // ----- drawer -----
+        // drawer
         val side = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Theme.BG)
+            setBackgroundColor(Theme.SURFACE)
             isClickable = true
         }
-        side.addView(TextView(this).apply {
-            text = "Задачи"
+        val sideHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), dp(24), dp(18), dp(14))
+        }
+        sideHead.addView(Md.logoView(this, 36), lp(dp(36), dp(36)))
+        val sideTitle = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        sideTitle.addView(TextView(this).apply {
+            text = "Qwen Coder"
             setTextColor(Theme.TEXT)
-            textSize = 18f
+            textSize = 17f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(18), dp(22), dp(18), dp(10))
         })
-        side.addView(pill("+  Новая задача", true) {
+        sideTitle.addView(TextView(this).apply {
+            text = "Native"
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+        })
+        sideHead.addView(sideTitle, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+        side.addView(sideHead, lp(-1, -2))
+        side.addView(gradientButton("+  Новая задача") {
             drawer.closeDrawers()
-            showNewTask(null)
-        }, LinearLayout.LayoutParams(-1, -2).apply {
+            startNewTask()
+        }, lp(-1, -2).apply {
             leftMargin = dp(14)
             rightMargin = dp(14)
-            bottomMargin = dp(8)
+            bottomMargin = dp(4)
         })
         taskBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        side.addView(ScrollView(this).apply { addView(taskBox, FrameLayout.LayoutParams(-1, -2)) }, LinearLayout.LayoutParams(-1, 0, 1f))
-        accountView = TextView(this).apply {
-            setTextColor(Theme.MUTED)
-            textSize = 13f
-            setPadding(dp(18), dp(12), dp(18), dp(14))
+        side.addView(ScrollView(this).apply { addView(taskBox, FrameLayout.LayoutParams(-1, -2)) }, lp(-1, 0, 1f))
+        side.addView(View(this).apply { setBackgroundColor(Theme.STROKE) }, lp(-1, 1))
+        val acc = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(14))
+            background = Md.rippleRect(null)
             setOnClickListener {
                 AlertDialog.Builder(this@MainActivity).setTitle("Выйти из аккаунта?")
                     .setPositiveButton("Выйти") { _, _ -> logout() }
                     .setNegativeButton("Отмена", null).show()
             }
         }
-        side.addView(accountView)
-        dl.addView(side, DrawerLayout.LayoutParams(dp(300), -1).apply { gravity = Gravity.START })
+        avatarView = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+        }
+        acc.addView(avatarView, lp(dp(38), dp(38)))
+        val accText = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        nameView = TextView(this).apply {
+            setTextColor(Theme.TEXT)
+            textSize = 14f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        emailView = TextView(this).apply {
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        accText.addView(nameView)
+        accText.addView(emailView)
+        acc.addView(accText, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+        acc.addView(TextView(this).apply {
+            text = "выйти"
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+        })
+        side.addView(acc, lp(-1, -2))
+        dl.addView(side, DrawerLayout.LayoutParams(dp(310), -1).apply { gravity = Gravity.START })
         return dl
     }
+
+    private fun buildEmpty(): LinearLayout {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(22), dp(40), dp(22), dp(16))
+        }
+        box.addView(Md.logoView(this, 68), lp(dp(68), dp(68)))
+        emptyTitle = TextView(this).apply {
+            setTextColor(Theme.TEXT)
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, dp(4))
+        }
+        emptySub = TextView(this).apply {
+            setTextColor(Theme.MUTED)
+            textSize = 14f
+            gravity = Gravity.CENTER
+        }
+        box.addView(emptyTitle, lp(-1, -2))
+        box.addView(emptySub, lp(-1, -2))
+        chipsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val prompts = listOf(
+            "Проанализируй репозиторий и расскажи об архитектуре",
+            "Найди баги и потенциальные проблемы в коде",
+            "Напиши тесты для основных модулей",
+            "Предложи улучшения и сделай рефакторинг"
+        )
+        for (p in prompts) {
+            chipsBox.addView(TextView(this).apply {
+                text = p
+                setTextColor(Theme.TEXT)
+                textSize = 14f
+                background = Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE)
+                setPadding(dp(16), dp(13), dp(16), dp(13))
+                setOnClickListener {
+                    input.setText(p)
+                    input.setSelection(p.length)
+                    input.requestFocus()
+                }
+            }, lp(-1, -2).apply { topMargin = dp(8) })
+        }
+        box.addView(chipsBox, lp(-1, -2).apply { topMargin = dp(26) })
+        return box
+    }
+
+    private fun updateFab() {
+        val child = scroll.getChildAt(0) ?: return
+        val dist = child.height - (scroll.height + scroll.scrollY)
+        fab.visibility = if (dist > dp(260)) View.VISIBLE else View.GONE
+    }
+
+    // ---------- screens / session ----------
 
     private fun showLogin() {
         loginView.visibility = View.VISIBLE
         drawer.visibility = View.GONE
     }
 
+    private fun updateAccount() {
+        val n = api.userName.ifEmpty { api.userEmail }.ifEmpty { "Аккаунт Qwen" }
+        nameView.text = n
+        emailView.text = api.userEmail
+        avatarView.text = n.firstOrNull()?.uppercase() ?: "Q"
+    }
+
     private fun showMain() {
         loginView.visibility = View.GONE
         drawer.visibility = View.VISIBLE
-        accountView.text = (api.userName.ifEmpty { api.userEmail }).ifEmpty { "Аккаунт Qwen" } + "  ·  выйти"
+        updateAccount()
         updateHeader()
         render(emptyList())
         loadTasks()
+        loadEnvs(false)
         pool.execute {
             try {
                 api.me()
-                ui.post { accountView.text = (api.userName.ifEmpty { api.userEmail }).ifEmpty { "Аккаунт Qwen" } + "  ·  выйти" }
+                ui.post { updateAccount() }
             } catch (e: Exception) {
                 ui.post { handleError(e) }
             }
@@ -327,6 +585,8 @@ class MainActivity : Activity() {
         thread = emptyList()
         tasks = emptyList()
         envs = null
+        selEnv = null
+        selBranch = ""
         showLogin()
     }
 
@@ -340,12 +600,10 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- login ----------
-
     private fun doLogin(raw: String) {
         val (a, r) = TokenParser.extract(raw)
         if (a == null && r == null) {
-            loginStatus.text = "В тексте не найден токен (ожидается строка, начинающаяся с eyJ…)"
+            loginStatus.text = "В тексте не найден токен (строка, начинающаяся с eyJ…)"
             return
         }
         loginStatus.text = "Проверяю вход…"
@@ -366,6 +624,354 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- repositories ----------
+
+    private fun defaultBranch(e: Env): String =
+        e.branches.firstOrNull { it == "main" } ?: e.branches.firstOrNull { it == "master" } ?: e.branches.firstOrNull().orEmpty()
+
+    private fun loadEnvs(force: Boolean, done: (() -> Unit)? = null) {
+        if (!force && envs != null) {
+            restoreSelection()
+            done?.invoke()
+            return
+        }
+        pool.execute {
+            try {
+                val e = api.environments()
+                ui.post {
+                    envs = e
+                    restoreSelection()
+                    done?.invoke()
+                }
+            } catch (ex: Exception) {
+                ui.post { handleError(ex) }
+            }
+        }
+    }
+
+    private fun restoreSelection() {
+        val list = envs ?: return
+        val keep = selEnv?.id ?: prefs.getString("last_env_id", null)
+        val e = list.firstOrNull { it.id == keep }
+        if (e != null) {
+            selEnv = e
+            val b = if (selBranch.isNotEmpty() && selEnv?.id == e.id && e.branches.contains(selBranch)) selBranch
+            else prefs.getString("branch_" + e.id, null)?.takeIf { e.branches.contains(it) } ?: defaultBranch(e)
+            selBranch = b
+        } else {
+            selEnv = null
+            selBranch = ""
+        }
+        updateChips()
+    }
+
+    private fun updateChips() {
+        val id = curId
+        repoChip.text = if (id != null) {
+            curRepo.ifEmpty { "Без репозитория" }
+        } else {
+            val e = selEnv
+            if (e == null) "Выбрать репозиторий" else (e.repo.ifEmpty { e.name }) + if (selBranch.isNotEmpty()) " · $selBranch" else ""
+        }
+        repoChip.alpha = if (id != null) 0.7f else 1f
+        modelChip.text = modelTitle(selModel)
+    }
+
+    private fun modelTitle(id: String): String = models.firstOrNull { it.id == id }?.title ?: id
+
+    private fun isoAgo(iso: String): String {
+        if (iso.isEmpty()) return ""
+        return try {
+            val f = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+            f.timeZone = TimeZone.getTimeZone("UTC")
+            val d = f.parse(iso) ?: return ""
+            ago(d.time / 1000)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun openRepoPicker() {
+        if (curId != null) {
+            toast("Репозиторий открытой задачи изменить нельзя. Создайте новую задачу (+)")
+            return
+        }
+        val dlg = Dialog(this, android.R.style.Theme_Material_NoActionBar)
+        dlg.window?.setBackgroundDrawable(ColorDrawable(Theme.BG))
+        dlg.window?.statusBarColor = Theme.BG
+        dlg.window?.navigationBarColor = Theme.BG
+        dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Theme.BG)
+        }
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), 0, dp(8), 0)
+        }
+        val backBtn = icon(R.drawable.ic_close, "Закрыть") { dlg.dismiss() }
+        val topTitle = TextView(this).apply {
+            setTextColor(Theme.TEXT)
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(4), 0, 0, 0)
+        }
+        top.addView(backBtn)
+        top.addView(topTitle, lp(0, -2, 1f))
+        root.addView(top, lp(-1, dp(56)))
+        root.addView(View(this).apply { setBackgroundColor(Theme.STROKE) }, lp(-1, 1))
+        val search = EditText(this).apply {
+            setHintTextColor(Theme.MUTED)
+            setTextColor(Theme.TEXT)
+            textSize = 15f
+            setSingleLine()
+            compoundDrawablePadding = dp(10)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_search, 0, 0, 0)
+            compoundDrawableTintList = ColorStateList.valueOf(Theme.MUTED)
+            background = Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE)
+            setPadding(dp(14), dp(11), dp(14), dp(11))
+        }
+        root.addView(search, lp(-1, -2).apply {
+            leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(12); bottomMargin = dp(4)
+        })
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, 0, dp(12)) }
+        root.addView(ScrollView(this).apply { addView(listBox, FrameLayout.LayoutParams(-1, -2)) }, lp(-1, 0, 1f))
+
+        var stage = 0
+        var pickedEnv: Env? = null
+        var ghState: Boolean? = null
+        var filter = ""
+
+        fun row(title: String, sub: String, selected: Boolean, iconRes: Int, onClick: () -> Unit): View {
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = Md.rippleRect(if (selected) Md.round(Theme.SURFACE2, 14, this@MainActivity, Theme.ACCENT) else Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE))
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                setOnClickListener { onClick() }
+            }
+            r.addView(ImageView(this).apply {
+                setImageResource(iconRes)
+                setColorFilter(if (selected) Theme.ACCENT else Theme.MUTED)
+            }, lp(dp(22), dp(22)))
+            val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            tb.addView(TextView(this).apply {
+                text = title
+                setTextColor(Theme.TEXT)
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            if (sub.isNotEmpty()) tb.addView(TextView(this).apply {
+                text = sub
+                setTextColor(Theme.MUTED)
+                textSize = 12f
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            r.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+            if (selected) r.addView(ImageView(this).apply {
+                setImageResource(R.drawable.ic_check)
+                setColorFilter(Theme.ACCENT)
+            }, lp(dp(20), dp(20)))
+            r.layoutParams = lp(-1, -2).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(8) }
+            return r
+        }
+
+        lateinit var showRepos: () -> Unit
+        lateinit var showBranches: () -> Unit
+
+        showRepos = {
+            stage = 0
+            topTitle.text = "Репозиторий"
+            backBtn.setImageResource(R.drawable.ic_close)
+            search.hint = "Поиск репозитория"
+            listBox.removeAllViews()
+            val all = envs
+            if (all == null) {
+                listBox.addView(TextView(this).apply {
+                    text = "Загрузка репозиториев…"
+                    setTextColor(Theme.MUTED)
+                    setPadding(dp(18), dp(18), dp(18), dp(18))
+                })
+            } else {
+                listBox.addView(row("Без репозитория", "Свободный чат без привязки к коду", selEnv == null, R.drawable.ic_sparkle) {
+                    selEnv = null
+                    selBranch = ""
+                    prefs.edit().remove("last_env_id").apply()
+                    updateChips()
+                    dlg.dismiss()
+                })
+                val shownList = all.filter {
+                    filter.isEmpty() || (it.repo + " " + it.name).lowercase().contains(filter.lowercase())
+                }
+                for (e in shownList) {
+                    val parts = ArrayList<String>()
+                    parts.add(if (e.isPrivate) "Приватный" else "Публичный")
+                    if (e.branches.isNotEmpty()) parts.add(e.branches.size.toString() + " вет.")
+                    val a = isoAgo(e.pushed)
+                    if (a.isNotEmpty()) parts.add("обновлён $a назад")
+                    listBox.addView(row(e.repo.ifEmpty { e.name }, parts.joinToString(" · "), selEnv?.id == e.id, R.drawable.ic_repo) {
+                        pickedEnv = e
+                        filter = ""
+                        search.setText("")
+                        showBranches()
+                    })
+                }
+                if (shownList.isEmpty() && filter.isNotEmpty()) {
+                    listBox.addView(TextView(this).apply {
+                        text = "Ничего не найдено"
+                        setTextColor(Theme.MUTED)
+                        setPadding(dp(18), dp(14), dp(18), dp(6))
+                    })
+                }
+                listBox.addView(sectionLabel("GitHub"))
+                val gh = TextView(this).apply {
+                    text = when (ghState) {
+                        true -> "Аккаунт GitHub подключён к Qwen Coder"
+                        false -> "GitHub не подключён к Qwen Coder. Подключите его на сайте"
+                        null -> "Проверяю подключение GitHub…"
+                    }
+                    setTextColor(if (ghState == false) Theme.AMBER else Theme.MUTED)
+                    textSize = 13f
+                    setPadding(dp(18), 0, dp(18), dp(8))
+                }
+                listBox.addView(gh)
+                listBox.addView(outlineButton("Добавить репозиторий на сайте Qwen") {
+                    refreshEnvsOnResume = true
+                    openUrl("https://coder.qwen.ai/")
+                    dlg.dismiss()
+                }, lp(-1, -2).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(4) })
+                listBox.addView(outlineButton("Обновить список") {
+                    envs = null
+                    showRepos()
+                    loadEnvs(true) { if (dlg.isShowing && stage == 0) showRepos() }
+                }, lp(-1, -2).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(8) })
+            }
+        }
+
+        showBranches = {
+            val e = pickedEnv
+            if (e != null) {
+                stage = 1
+                topTitle.text = e.repo.ifEmpty { e.name }
+                backBtn.setImageResource(R.drawable.ic_back)
+                search.hint = "Поиск ветки"
+                listBox.removeAllViews()
+                val bs = e.branches.sortedBy { if (it == "main" || it == "master") 0 else 1 }
+                val curBranch = if (selEnv?.id == e.id) selBranch else prefs.getString("branch_" + e.id, "").orEmpty()
+                val f = bs.filter { filter.isEmpty() || it.lowercase().contains(filter.lowercase()) }
+                if (f.isEmpty()) {
+                    listBox.addView(TextView(this).apply {
+                        text = if (bs.isEmpty()) "Ветки не найдены. Нажмите «Обновить»" else "Ничего не найдено"
+                        setTextColor(Theme.MUTED)
+                        setPadding(dp(18), dp(18), dp(18), dp(8))
+                    })
+                }
+                for (b in f) {
+                    listBox.addView(row(b, if (b == "main" || b == "master") "Основная ветка" else "", b == curBranch, R.drawable.ic_repo) {
+                        selEnv = e
+                        selBranch = b
+                        prefs.edit().putString("last_env_id", e.id).putString("branch_" + e.id, b).apply()
+                        updateChips()
+                        dlg.dismiss()
+                    })
+                }
+                listBox.addView(outlineButton("Обновить ветки") {
+                    pool.execute {
+                        try {
+                            val fresh = api.environment(e.id)
+                            ui.post {
+                                envs = envs?.map { if (it.id == fresh.id) fresh else it }
+                                pickedEnv = fresh
+                                if (dlg.isShowing && stage == 1) showBranches()
+                            }
+                        } catch (ex: Exception) {
+                            ui.post { handleError(ex) }
+                        }
+                    }
+                }, lp(-1, -2).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(12) })
+            }
+        }
+
+        backBtn.setOnClickListener {
+            if (stage == 1) {
+                filter = ""
+                search.setText("")
+                showRepos()
+            } else {
+                dlg.dismiss()
+            }
+        }
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val v = s?.toString().orEmpty().trim()
+                if (v != filter) {
+                    filter = v
+                    if (stage == 0) showRepos() else showBranches()
+                }
+            }
+        })
+
+        dlg.setContentView(root)
+        showRepos()
+        dlg.show()
+        loadEnvs(envs == null) { if (dlg.isShowing && stage == 0) showRepos() }
+        pool.execute {
+            val g = api.githubConnected()
+            ui.post {
+                ghState = g
+                if (dlg.isShowing && stage == 0) showRepos()
+            }
+        }
+    }
+
+    // ---------- models ----------
+
+    private fun openModelPicker() {
+        val titles = ArrayList<String>()
+        for (m in models) titles.add((if (m.id == selModel) "✓  " else "     ") + m.title + "  ·  " + m.hint)
+        val custom = models.none { it.id == selModel }
+        if (custom) titles.add("✓  $selModel  ·  свой ID")
+        titles.add("Указать ID модели вручную…")
+        AlertDialog.Builder(this)
+            .setTitle("Модель")
+            .setItems(titles.toTypedArray()) { _, which ->
+                if (which < models.size) {
+                    setModel(models[which].id)
+                } else if (custom && which == models.size) {
+                    // current custom model is already selected
+                } else {
+                    askCustomModel()
+                }
+            }.show()
+    }
+
+    private fun askCustomModel() {
+        val et = EditText(this).apply {
+            setSingleLine()
+            hint = "например, qwen3.8-max"
+            setText(selModel)
+            setSelection(text.length)
+        }
+        AlertDialog.Builder(this).setTitle("ID модели").setView(et)
+            .setPositiveButton("Сохранить") { _, _ ->
+                val v = et.text.toString().trim()
+                if (v.isNotEmpty()) setModel(v)
+            }
+            .setNegativeButton("Отмена", null).show()
+    }
+
+    private fun setModel(id: String) {
+        selModel = id
+        prefs.edit().putString("model", id).apply()
+        updateChips()
+    }
+
     // ---------- tasks ----------
 
     private fun statusLabel(s: String) = when (s) {
@@ -373,6 +979,31 @@ class MainActivity : Activity() {
         "finished" -> "готово"
         "" -> ""
         else -> s
+    }
+
+    private fun ago(sec: Long): String {
+        if (sec <= 0) return ""
+        val d = System.currentTimeMillis() / 1000 - sec
+        return when {
+            d < 60 -> "сейчас"
+            d < 3600 -> "${d / 60} мин"
+            d < 86400 -> "${d / 3600} ч"
+            d < 86400 * 30 -> "${d / 86400} д"
+            else -> "${d / (86400 * 30)} мес"
+        }
+    }
+
+    private fun dayNumber(ms: Long): Long = (ms + TimeZone.getDefault().getOffset(ms)) / 86_400_000L
+
+    private fun groupOf(sec: Long): String {
+        if (sec <= 0) return "Ранее"
+        val diff = dayNumber(Calendar.getInstance().timeInMillis) - dayNumber(sec * 1000)
+        return when {
+            diff <= 0 -> "Сегодня"
+            diff == 1L -> "Вчера"
+            diff <= 7 -> "На этой неделе"
+            else -> "Ранее"
+        }
     }
 
     private fun loadTasks() {
@@ -395,15 +1026,23 @@ class MainActivity : Activity() {
             taskBox.addView(TextView(this).apply {
                 text = "Пока нет задач"
                 setTextColor(Theme.MUTED)
-                setPadding(dp(18), dp(12), dp(18), dp(12))
+                setPadding(dp(18), dp(16), dp(18), dp(12))
             })
             return
         }
+        var lastGroup = ""
         for (t in tasks) {
+            val g = groupOf(t.updatedAt)
+            if (g != lastGroup) {
+                taskBox.addView(sectionLabel(g))
+                lastGroup = g
+            }
+            val sel = t.id == curId
             val row = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(18), dp(10), dp(18), dp(10))
-                if (t.id == curId) setBackgroundColor(Theme.SURFACE)
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = Md.rippleRect(if (sel) Md.round(Theme.SURFACE2, 12, this@MainActivity) else null)
+                setPadding(dp(14), dp(10), dp(14), dp(10))
                 setOnClickListener {
                     drawer.closeDrawers()
                     openTask(t.id, t.title, t.repo, t.branch)
@@ -415,22 +1054,34 @@ class MainActivity : Activity() {
                     true
                 }
             }
-            row.addView(TextView(this).apply {
+            row.addView(View(this).apply {
+                background = Md.circle(if (t.status == "running") Theme.AMBER else if (t.status == "finished") Theme.GREEN else Theme.MUTED)
+            }, lp(dp(8), dp(8)).apply { rightMargin = dp(12) })
+            val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            tb.addView(TextView(this).apply {
                 text = t.title.ifEmpty { "Без названия" }
                 setTextColor(Theme.TEXT)
-                textSize = 15f
+                textSize = 14.5f
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
             })
-            val sub = listOf(t.repo, t.branch, statusLabel(t.status)).filter { it.isNotEmpty() }.joinToString(" · ")
-            row.addView(TextView(this).apply {
+            val sub = listOf(t.repo, t.branch).filter { it.isNotEmpty() }.joinToString(" · ")
+            if (sub.isNotEmpty()) tb.addView(TextView(this).apply {
                 text = sub
                 setTextColor(Theme.MUTED)
                 textSize = 12f
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
             })
-            taskBox.addView(row, LinearLayout.LayoutParams(-1, -2))
+            row.addView(tb, lp(0, -2, 1f))
+            row.addView(TextView(this).apply {
+                text = ago(t.updatedAt)
+                setTextColor(Theme.MUTED)
+                textSize = 11f
+                setPadding(dp(8), 0, 0, 0)
+            })
+            row.layoutParams = lp(-1, -2).apply { leftMargin = dp(8); rightMargin = dp(8) }
+            taskBox.addView(row)
         }
     }
 
@@ -440,10 +1091,7 @@ class MainActivity : Activity() {
                 api.deleteTask(id)
                 ui.post {
                     if (curId == id) {
-                        curId = null
-                        thread = emptyList()
-                        updateHeader()
-                        render(emptyList())
+                        resetChat(null, "", "", "")
                     }
                     loadTasks()
                 }
@@ -464,11 +1112,23 @@ class MainActivity : Activity() {
         streaming = false
         running = false
         cancelled = false
-        expanded.clear()
+        openSteps.clear()
         updateSend()
         updateHeader()
+        updateChips()
+        shown = emptyList()
+        list.removeAllViews()
         render(emptyList())
         renderTasks()
+    }
+
+    private fun startNewTask() {
+        resetChat(null, "", "", "")
+        drawer.closeDrawers()
+        input.requestFocus()
+        loadEnvs(false) {
+            if (selEnv == null && !prefs.contains("last_env_id") && (envs?.isNotEmpty() == true)) openRepoPicker()
+        }
     }
 
     private fun openTask(id: String, title: String, repo: String, branch: String) {
@@ -476,15 +1136,47 @@ class MainActivity : Activity() {
         fetchDetail(id)
     }
 
+    private fun setWorking(on: Boolean) {
+        if (on) {
+            statusDot.background = Md.circle(Theme.AMBER)
+            if (statusAnim == null) {
+                statusAnim = ObjectAnimator.ofFloat(statusDot, "alpha", 0.3f, 1f).apply {
+                    duration = 700
+                    repeatCount = ValueAnimator.INFINITE
+                    repeatMode = ValueAnimator.REVERSE
+                    start()
+                }
+            }
+        } else {
+            statusAnim?.cancel()
+            statusAnim = null
+            statusDot.alpha = 1f
+            statusDot.background = Md.circle(Theme.GREEN)
+        }
+    }
+
     private fun updateHeader() {
-        titleView.text = curTitle.ifEmpty { "Qwen Coder" }
-        val state = if (streaming || running) "работает…" else ""
-        subtitleView.text = listOf(curRepo, state).filter { it.isNotEmpty() }.joinToString(" · ")
-        subtitleView.visibility = if (subtitleView.text.isEmpty()) View.GONE else View.VISIBLE
+        val working = streaming || running
+        titleView.text = if (curId == null) "Новая задача" else curTitle.ifEmpty { "Qwen Coder" }
+        if (curId == null) {
+            statusDot.visibility = View.GONE
+            setWorking(false)
+            subtitleView.text = "Выберите репозиторий и модель"
+            subtitleView.setTextColor(Theme.MUTED)
+            emptyTitle.text = "Что будем делать?"
+            emptySub.text = "Выберите репозиторий и модель внизу,\nзатем опишите задачу"
+        } else {
+            statusDot.visibility = View.VISIBLE
+            setWorking(working)
+            subtitleView.text = if (working) "Работает…" else curRepo.ifEmpty { "Готов" }
+            subtitleView.setTextColor(if (working) Theme.AMBER else Theme.MUTED)
+            emptyTitle.text = "Задача пуста"
+            emptySub.text = "Напишите сообщение, чтобы продолжить"
+        }
     }
 
     private fun updateSend() {
-        sendBtn.setImageResource(if (streaming) android.R.drawable.ic_media_pause else android.R.drawable.ic_menu_send)
+        sendBtn.setImageResource(if (streaming) R.drawable.ic_stop else R.drawable.ic_send)
     }
 
     // ---------- detail / polling ----------
@@ -521,6 +1213,7 @@ class MainActivity : Activity() {
             curRepo = listOf(repo, br).filter { it.isNotEmpty() }.joinToString(" · ")
         }
         updateHeader()
+        updateChips()
         rebuildDisplay()
     }
 
@@ -585,12 +1278,11 @@ class MainActivity : Activity() {
     // ---------- rendering ----------
 
     private fun render(display: List<ChatMsg>) {
-        if (display == shown) {
-            emptyView.visibility = if (display.isEmpty()) View.VISIBLE else View.GONE
-            return
-        }
+        emptyBox.visibility = if (display.isEmpty()) View.VISIBLE else View.GONE
+        chipsBox.visibility = if (display.isEmpty() && curId == null) View.VISIBLE else View.GONE
+        if (display == shown) return
         val child = scroll.getChildAt(0)
-        val atBottom = child == null || child.height - (scroll.height + scroll.scrollY) < dp(160)
+        val atBottom = child == null || child.height - (scroll.height + scroll.scrollY) < dp(180)
         for (i in display.indices) {
             if (i < shown.size && shown[i] == display[i]) continue
             val v = makeView(display[i])
@@ -599,69 +1291,176 @@ class MainActivity : Activity() {
         }
         while (list.childCount > display.size) list.removeViewAt(list.childCount - 1)
         shown = display
-        emptyView.visibility = if (display.isEmpty()) View.VISIBLE else View.GONE
         if (atBottom) scroll.post { scroll.scrollTo(0, scroll.getChildAt(0).height) }
+        scroll.post { updateFab() }
     }
 
-    private fun makeView(m: ChatMsg): View {
-        if (m.role == "user") {
-            val wrap = LinearLayout(this).apply {
-                gravity = Gravity.END
-                layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) }
-            }
-            wrap.addView(TextView(this).apply {
-                text = m.text
-                setTextColor(Theme.TEXT)
-                textSize = 15.5f
-                setTextIsSelectable(true)
-                background = Md.round(Theme.USER_BUBBLE, 18, this@MainActivity)
-                setPadding(dp(14), dp(10), dp(14), dp(10))
-                maxWidth = (resources.displayMetrics.widthPixels * 0.85).toInt()
-            })
-            return wrap
+    private fun makeView(m: ChatMsg): View = if (m.role == "user") userView(m) else assistantView(m)
+
+    private fun userView(m: ChatMsg): View {
+        val wrap = LinearLayout(this).apply {
+            gravity = Gravity.END
+            layoutParams = lp(-1, -2).apply { bottomMargin = dp(16) }
         }
+        wrap.addView(TextView(this).apply {
+            text = m.text
+            setTextColor(Color.WHITE)
+            textSize = 15.5f
+            setTextIsSelectable(true)
+            background = Md.gradient(this@MainActivity, Theme.USER1, Theme.USER2, 20)
+            setPadding(dp(15), dp(11), dp(15), dp(11))
+            maxWidth = (resources.displayMetrics.widthPixels * 0.84).toInt()
+        })
+        return wrap
+    }
+
+    private fun assistantView(m: ChatMsg): View {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(18) }
+            layoutParams = lp(-1, -2).apply { bottomMargin = dp(22) }
         }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(8))
+        }
+        head.addView(Md.logoView(this, 20), lp(dp(20), dp(20)))
+        head.addView(TextView(this).apply {
+            text = "Qwen Coder"
+            setTextColor(Theme.MUTED)
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(8), 0, 0, 0)
+        })
+        col.addView(head)
+        if (m.thinking.isNotBlank()) col.addView(thinkingView(m))
         if (m.steps.isNotEmpty()) col.addView(stepsView(m))
         if (m.text.isNotBlank()) {
             val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             Md.render(this, box, m.text)
             col.addView(box)
         } else if (m.error == null) {
-            col.addView(TextView(this).apply {
-                text = if (m.done) "(пустой ответ)" else "Qwen работает…"
-                setTextColor(Theme.MUTED)
-                textSize = 14f
-            })
+            if (m.done) {
+                col.addView(TextView(this).apply {
+                    text = "(пустой ответ)"
+                    setTextColor(Theme.MUTED)
+                    textSize = 14f
+                })
+            } else {
+                col.addView(typingView())
+            }
         }
         if (m.error != null) {
             col.addView(TextView(this).apply {
                 text = "Ошибка: " + m.error
-                setTextColor(Color.rgb(240, 110, 110))
+                setTextColor(Theme.RED)
                 textSize = 14f
-                setPadding(0, dp(4), 0, 0)
+                background = Md.round(Color.argb(30, 248, 113, 113), 10, this@MainActivity)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+            })
+        }
+        if (m.done && m.text.isNotBlank() && m.id != "live" && m.id != "wait") {
+            col.addView(TextView(this).apply {
+                text = "Копировать ответ"
+                setTextColor(Theme.MUTED)
+                textSize = 12f
+                setPadding(0, dp(6), dp(12), dp(6))
+                setOnClickListener { Md.copy(this@MainActivity, m.text) }
             })
         }
         return col
     }
 
-    private fun stepsView(m: ChatMsg): View {
+    private fun typingView(): View {
+        val tv = TextView(this).apply {
+            text = "●  ●  ●"
+            setTextColor(Theme.ACCENT)
+            textSize = 12f
+            setPadding(dp(2), dp(4), 0, dp(4))
+        }
+        val anim = ObjectAnimator.ofFloat(tv, "alpha", 0.25f, 1f).apply {
+            duration = 750
+            repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.REVERSE
+            start()
+        }
+        tv.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {}
+            override fun onViewDetachedFromWindow(v: View) {
+                anim.cancel()
+            }
+        })
+        return tv
+    }
+
+    private fun thinkingView(m: ChatMsg): View {
+        val key = "think:" + m.id
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = Md.round(Theme.SURFACE, 12, this@MainActivity)
-            setPadding(dp(12), dp(10), dp(12), dp(6))
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }
+            background = Md.round(Theme.SURFACE, 12, this@MainActivity, Theme.STROKE)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            layoutParams = lp(-1, -2).apply { bottomMargin = dp(10) }
+        }
+        val body = TextView(this).apply {
+            text = m.thinking
+            setTextColor(Theme.MUTED)
+            textSize = 13f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.ITALIC)
+            setPadding(0, dp(6), 0, dp(2))
+            setTextIsSelectable(true)
+            visibility = if (openSteps.contains(key)) View.VISIBLE else View.GONE
         }
         card.addView(TextView(this).apply {
-            text = "Действия: " + m.steps.size
+            text = "Размышления  ▾"
             setTextColor(Theme.MUTED)
-            textSize = 12f
-            setPadding(0, 0, 0, dp(4))
+            textSize = 12.5f
+            setPadding(0, dp(2), 0, dp(2))
+            setOnClickListener {
+                if (body.visibility == View.VISIBLE) {
+                    body.visibility = View.GONE
+                    openSteps.remove(key)
+                } else {
+                    body.visibility = View.VISIBLE
+                    openSteps.add(key)
+                }
+            }
         })
+        card.addView(body)
+        return card
+    }
+
+    private fun stepsView(m: ChatMsg): View {
+        val key = "card:" + m.id
+        val defaultCollapsed = m.steps.size > 5
+        val collapsed = defaultCollapsed != cardToggled.contains(key)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE)
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            layoutParams = lp(-1, -2).apply { bottomMargin = dp(12) }
+        }
+        val rowsBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = if (collapsed) View.GONE else View.VISIBLE
+        }
+        val working = m.steps.any { it.status == "running" } || !m.done
+        val title = TextView(this).apply {
+            text = "Действия агента · ${m.steps.size}" + if (collapsed) "   ▸" else "   ▾"
+            setTextColor(if (working) Theme.AMBER else Theme.MUTED)
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        title.setOnClickListener {
+            val nowCollapsed = rowsBox.visibility == View.VISIBLE
+            rowsBox.visibility = if (nowCollapsed) View.GONE else View.VISIBLE
+            title.text = "Действия агента · ${m.steps.size}" + if (nowCollapsed) "   ▸" else "   ▾"
+            if (nowCollapsed == defaultCollapsed) cardToggled.remove(key) else cardToggled.add(key)
+        }
+        card.addView(title)
         for (s in m.steps) {
-            val ok = s.status == "finished" || s.status == "done" || s.status == "success"
+            val ok = s.status == "finished" || s.status == "done" || s.status == "success" || s.status == "completed"
+            val bad = s.status == "failed" || s.status == "error"
             val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             val logView = TextView(this).apply {
                 text = if (s.log.length > 6000) s.log.take(6000) + "\n…" else s.log.ifEmpty { "(нет вывода)" }
@@ -669,30 +1468,51 @@ class MainActivity : Activity() {
                 textSize = 11.5f
                 setTextColor(Color.rgb(190, 200, 215))
                 setTextIsSelectable(true)
-                setPadding(dp(4), dp(2), dp(4), dp(6))
-                visibility = if (expanded.contains(s.id)) View.VISIBLE else View.GONE
+                background = Md.round(Theme.CODE_BG, 8, this@MainActivity)
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                visibility = if (openSteps.contains(s.id)) View.VISIBLE else View.GONE
             }
-            val title = TextView(this).apply {
-                text = (if (ok) "✓ " else "● ") + s.type.ifEmpty { "Шаг" } + " · " + s.action.replace("\n", " ").take(110)
-                setTextColor(if (ok) Color.rgb(130, 200, 150) else Color.rgb(240, 180, 90))
-                textSize = 13f
-                maxLines = 2
-                ellipsize = TextUtils.TruncateAt.END
-                setPadding(0, dp(4), 0, dp(4))
+            val line = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, dp(6))
                 setOnClickListener {
                     if (logView.visibility == View.VISIBLE) {
                         logView.visibility = View.GONE
-                        expanded.remove(s.id)
+                        openSteps.remove(s.id)
                     } else {
                         logView.visibility = View.VISIBLE
-                        expanded.add(s.id)
+                        openSteps.add(s.id)
                     }
                 }
             }
-            row.addView(title)
-            row.addView(logView)
-            card.addView(row)
+            line.addView(TextView(this).apply {
+                text = if (ok) "✓" else if (bad) "✕" else "●"
+                setTextColor(if (ok) Theme.GREEN else if (bad) Theme.RED else Theme.AMBER)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }, lp(dp(20), -2))
+            line.addView(TextView(this).apply {
+                text = s.type.ifEmpty { "Шаг" }
+                setTextColor(Theme.MUTED)
+                textSize = 11f
+                background = Md.round(Theme.SURFACE2, 6, this@MainActivity)
+                setPadding(dp(7), dp(2), dp(7), dp(2))
+            }, lp(-2, -2).apply { leftMargin = dp(4); rightMargin = dp(8) })
+            line.addView(TextView(this).apply {
+                text = s.action.replace("\n", " ")
+                setTextColor(Theme.TEXT)
+                textSize = 12.5f
+                typeface = Typeface.MONOSPACE
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }, lp(0, -2, 1f))
+            row.addView(line)
+            row.addView(logView, lp(-1, -2).apply { bottomMargin = dp(6) })
+            rowsBox.addView(row)
         }
+        card.addView(rowsBox)
         return card
     }
 
@@ -708,12 +1528,40 @@ class MainActivity : Activity() {
         val t = input.text.toString().trim()
         if (t.isEmpty()) return
         val id = curId
-        if (id == null) {
-            showNewTask(t)
+        if (id != null) {
+            input.setText("")
+            startStream(id, t)
             return
         }
+        val env = selEnv
+        val branch = selBranch
+        val mdl = selModel
         input.setText("")
-        startStream(id, t)
+        pending = t
+        pendingBase = 0
+        streaming = true
+        updateSend()
+        rebuildDisplay()
+        pool.execute {
+            try {
+                val newId = api.newTask(env, branch, mdl)
+                ui.post {
+                    streaming = false
+                    resetChat(newId, "Новый чат", env?.repo ?: "", branch)
+                    startStream(newId, t)
+                    loadTasks()
+                }
+            } catch (e: Exception) {
+                ui.post {
+                    streaming = false
+                    pending = null
+                    updateSend()
+                    input.setText(t)
+                    rebuildDisplay()
+                    handleError(e)
+                }
+            }
+        }
     }
 
     private fun startStream(id: String, text: String) {
@@ -727,7 +1575,7 @@ class MainActivity : Activity() {
         rebuildDisplay()
         startPolling()
         val parent = leafId
-        val mdl = model()
+        val mdl = selModel
         pool.execute {
             var err: String? = null
             try {
@@ -772,81 +1620,6 @@ class MainActivity : Activity() {
         scheduleRender()
     }
 
-    // ---------- new task ----------
-
-    private fun showNewTask(text: String?) {
-        toast("Загружаю репозитории…")
-        pool.execute {
-            try {
-                val e = envs ?: api.environments().also { envs = it }
-                ui.post { newTaskDialog(e, text) }
-            } catch (ex: Exception) {
-                ui.post { handleError(ex) }
-            }
-        }
-    }
-
-    private fun newTaskDialog(envList: List<Env>, text: String?) {
-        val names = listOf("Без репозитория") + envList.map { it.repo.ifEmpty { it.name } }
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
-        }
-        val envSp = Spinner(this)
-        envSp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
-        val brSp = Spinner(this)
-        val modelEt = EditText(this).apply {
-            hint = "Модель"
-            setSingleLine()
-            setText(model())
-        }
-        fun fill(pos: Int) {
-            val bs: List<String> = if (pos == 0) emptyList<String>() else envList[pos - 1].branches.sortedBy { if (it == "main" || it == "master") 0 else 1 }
-            brSp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, bs)
-            brSp.isEnabled = bs.isNotEmpty()
-        }
-        envSp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) = fill(position)
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
-        box.addView(TextView(this).apply { this.text = "Репозиторий" })
-        box.addView(envSp)
-        box.addView(TextView(this).apply { this.text = "Ветка" })
-        box.addView(brSp)
-        box.addView(modelEt)
-        val last = prefs.getInt("last_env", 0)
-        if (last in names.indices) envSp.setSelection(last)
-        fill(envSp.selectedItemPosition)
-
-        AlertDialog.Builder(this)
-            .setTitle("Новая задача")
-            .setView(box)
-            .setPositiveButton("Создать") { _, _ ->
-                val pos = envSp.selectedItemPosition
-                val env = if (pos == 0) null else envList[pos - 1]
-                val branch = (brSp.selectedItem as? String).orEmpty()
-                val mdl = modelEt.text.toString().trim().ifEmpty { "qwen3-coder-plus" }
-                prefs.edit().putString("model", mdl).putInt("last_env", pos).apply()
-                pool.execute {
-                    try {
-                        val id = api.newTask(env, branch, mdl)
-                        ui.post {
-                            resetChat(id, "Новый чат", env?.repo ?: "", branch)
-                            if (text != null) {
-                                input.setText("")
-                                startStream(id, text)
-                            }
-                            loadTasks()
-                        }
-                    } catch (e: Exception) {
-                        ui.post { handleError(e) }
-                    }
-                }
-            }
-            .setNegativeButton("Отмена", null)
-            .show()
-    }
-
     // ---------- menu ----------
 
     private fun openUrl(url: String) {
@@ -870,10 +1643,13 @@ class MainActivity : Activity() {
             items.add("Открыть превью проекта" to { openUrl("https://$id.preview.qwenlm.io/") })
             items.add("Открыть задачу на сайте" to { openUrl("https://coder.qwen.ai/c/$id") })
         }
-        items.add("Репозитории и GitHub (сайт)" to { openUrl("https://coder.qwen.ai/") })
-        items.add("Модель: " + model() to { changeModel() })
-        items.add("Обновить" to {
+        items.add("Репозитории и GitHub (сайт)" to {
+            refreshEnvsOnResume = true
+            openUrl("https://coder.qwen.ai/")
+        })
+        items.add("Обновить всё" to {
             envs = null
+            loadEnvs(true)
             loadTasks()
             if (id != null) fetchDetail(id)
         })
@@ -882,19 +1658,6 @@ class MainActivity : Activity() {
             .setTitle("Qwen Coder")
             .setItems(items.map { it.first }.toTypedArray()) { _, which -> items[which].second() }
             .show()
-    }
-
-    private fun changeModel() {
-        val et = EditText(this).apply {
-            setSingleLine()
-            setText(model())
-        }
-        AlertDialog.Builder(this).setTitle("ID модели").setView(et)
-            .setPositiveButton("Сохранить") { _, _ ->
-                val v = et.text.toString().trim()
-                if (v.isNotEmpty()) prefs.edit().putString("model", v).apply()
-            }
-            .setNegativeButton("Отмена", null).show()
     }
 
     // ---------- dictation ----------
@@ -939,7 +1702,7 @@ class MainActivity : Activity() {
             })
         }
         listening = true
-        micBtn.setColorFilter(Color.RED)
+        micBtn.setColorFilter(Theme.RED)
         recognizer?.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
@@ -949,7 +1712,7 @@ class MainActivity : Activity() {
 
     private fun finishDictation() {
         listening = false
-        micBtn.setColorFilter(Color.WHITE)
+        micBtn.setColorFilter(Theme.MUTED)
         recognizer?.destroy()
         recognizer = null
     }
@@ -972,6 +1735,11 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if ((streaming || running) && curId != null) startPolling()
+        if (refreshEnvsOnResume && api.loggedIn) {
+            refreshEnvsOnResume = false
+            envs = null
+            loadEnvs(true) { toast("Список репозиториев обновлён") }
+        }
     }
 
     @Deprecated("Legacy back handling")
@@ -981,6 +1749,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
+        statusAnim?.cancel()
         api.cancelStream()
         recognizer?.destroy()
         pool.shutdownNow()
