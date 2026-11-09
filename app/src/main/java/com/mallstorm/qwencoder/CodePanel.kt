@@ -384,7 +384,13 @@ class CodePanel(
                 setBackgroundColor(Color.WHITE)
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
-                webViewClient = WebViewClient()
+                webViewClient = object : WebViewClient() {
+                    override fun onReceivedHttpError(v: WebView, r: android.webkit.WebResourceRequest, e: android.webkit.WebResourceResponse) {
+                        if (r.isForMainFrame && e.statusCode >= 400) {
+                            v.loadDataWithBaseURL(null, "<html><body style='margin:0;background:#${String.format("%06x", Theme.BG and 0xFFFFFF)};color:#${String.format("%06x", Theme.MUTED and 0xFFFFFF)};font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center'><div style='padding:32px;font-size:15px;line-height:1.5'>Превью недоступно.<br>Агент пока не запустил веб-сервер в этой задаче.<br><br>Попросите его: «запусти проект для превью».</div></body></html>", "text/html", "utf-8", null)
+                        }
+                    }
+                }
                 loadUrl(url)
             }
             webFor = id
