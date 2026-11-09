@@ -23,10 +23,16 @@ data class TaskItem(
     val id: String, val title: String, val status: String, val updatedAt: Long,
     val repo: String, val branch: String
 )
-data class Step(val id: String, val type: String, val action: String, val log: String, val status: String)
+data class Step(
+    val id: String, val type: String, val action: String, val log: String, val status: String,
+    val args: String = "", val tool: String = ""
+)
+data class FileChange(val path: String, val command: String, val oldText: String, val newText: String, val pending: Boolean = false)
+data class Usage(val remaining: Int, val status: String, val member: String, val resetAt: Long)
 data class ChatMsg(
     val id: String, val role: String, val text: String, val steps: List<Step>,
-    val thinking: String, val error: String?, val done: Boolean
+    val thinking: String, val error: String?, val done: Boolean,
+    val files: List<FileChange> = emptyList(), val commit: String = ""
 )
 
 /** Extracts Qwen tokens from whatever the user pastes (raw JWT, "refresh_token=...", Cookie header, JSON export). */
@@ -99,7 +105,7 @@ class Api(ctx: Context) {
     private fun tzHeader(): String =
         SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss 'GMT'Z", Locale.ENGLISH).format(Date())
 
-    private fun open(method: String, url: String, access: String?, sse: Boolean, extraCookie: String?): HttpURLConnection {
+    private fun open(method: String, url: String, access: String?, sse: Boolean, extraCookie: String?, useJar: Boolean = true): HttpURLConnection {
         val c = URL(url).openConnection() as HttpURLConnection
         c.requestMethod = method
         c.connectTimeout = 20000
@@ -123,7 +129,7 @@ class Api(ctx: Context) {
         }
         val cookies = ArrayList<String>()
         if (extraCookie != null) cookies.add(extraCookie)
-        synchronized(jar) { for ((k, v) in jar) cookies.add("$k=$v") }
+        if (useJar) synchronized(jar) { for ((k, v) in jar) cookies.add("$k=$v") }
         if (cookies.isNotEmpty()) c.setRequestProperty("Cookie", cookies.joinToString("; "))
         return c
     }
@@ -143,15 +149,15 @@ class Api(ctx: Context) {
 
     private class Raw(val code: Int, val body: String)
 
-    private fun exec(method: String, url: String, body: String?, access: String?, extraCookie: String? = null): Raw {
-        val c = open(method, url, access, false, extraCookie)
+    private fun exec(method: String, url: String, body: String?, access: String?, extraCookie: String? = null, useJar: Boolean = true): Raw {
+        val c = open(method, url, access, false, extraCookie, useJar)
         try {
             if (body != null) {
                 c.doOutput = true
                 c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             }
             val code = c.responseCode
-            saveCookies(c)
+            if (useJar) saveCookies(c)
             val s = if (code in 200..399) c.inputStream else c.errorStream
             val text = s?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
             return Raw(code, text)
@@ -274,6 +280,50 @@ class Api(ctx: Context) {
         null
     }
 
+    fun running(): List<TaskItem> {
+        val arr = call("GET", "$CODER/coder/api/v2/task/running").optJSONArray("data") ?: return emptyList()
+        return (0 until arr.length()).map { parseTask(arr.getJSONObject(it)) }
+    }
+
+    fun pinned(): List<TaskItem> {
+        val arr = call("GET", "$CODER/coder/api/v2/task/pinned?page=1").optJSONArray("data") ?: return emptyList()
+        return (0 until arr.length()).map { parseTask(arr.getJSONObject(it)) }
+    }
+
+    fun getSettings(): JSONObject = call("GET", "$CODER/api/v2/users/user/settings").optJSONObject("data") ?: JSONObject()
+
+    fun updateSettings(s: JSONObject) {
+        call("POST", "$CODER/api/v2/users/user/settings/update", s)
+    }
+
+    fun usage(): Usage? = try {
+        val url = "https://sg-entitlement.qwen.com/api/entitlement/agent/usage?biz_id=ai_qwen&chat_client=h5&device=pc&fr=pc&pr=qwen-i18n&la=ru-RU&tz=Etc%2FGMT-3&wv=$VERSION"
+        val r = exec("GET", url, null, ensureAccess(), null, false)
+        val d = JSONObject(r.body).optJSONObject("data")
+        if (d == null) null else Usage(d.optInt("remainingPercent", -1), d.optString("status"), d.optString("memberType"), d.optLong("resetAt"))
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Edits that are still in progress (tool call args are known before the server reports file_list). */
+    fun changesFromSteps(steps: Collection<Step>): List<FileChange> {
+        val out = ArrayList<FileChange>()
+        for (s in steps) {
+            if (s.args.isEmpty()) continue
+            try {
+                val a = JSONObject(s.args)
+                val path = a.optString("path")
+                if (path.isEmpty()) continue
+                when (s.tool) {
+                    "create_file" -> out.add(FileChange(path, "create", "", a.optString("content"), true))
+                    "edit_file" -> out.add(FileChange(path, "patch", a.optString("context"), a.optString("replacement"), true))
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return out
+    }
+
     private fun parseTask(t: JSONObject): TaskItem {
         val info = t.optJSONObject("meta")?.optJSONObject("repo_info")
         return TaskItem(
@@ -316,7 +366,7 @@ class Api(ctx: Context) {
     }
 
     /** Streams SSE "data:" payloads of a completion. Blocking; run off the main thread. */
-    fun stream(chatId: String, text: String, parentId: String?, model: String, onData: (String) -> Unit) {
+    fun stream(chatId: String, text: String, parentId: String?, model: String, thinking: Boolean = false, onData: (String) -> Unit) {
         var attempt = 0
         while (true) {
             val access = ensureAccess(attempt > 0)
@@ -335,7 +385,7 @@ class Api(ctx: Context) {
                 .put("models", JSONArray().put(model))
                 .put("model", "")
                 .put("chat_type", "code")
-                .put("feature_config", JSONObject().put("thinking_enabled", false).put("output_schema", "phase"))
+                .put("feature_config", JSONObject().put("thinking_enabled", thinking).put("output_schema", "phase"))
                 .put("extra", JSONObject().put("meta", JSONObject().put("subChatType", "code")))
                 .put("sub_chat_type", "code")
                 .put("parent_id", pid)
@@ -407,14 +457,54 @@ class Api(ctx: Context) {
             val id = l.optString("function_id").ifEmpty { "step$i" }
             val old = into[id]
             if (old == null && l.optString("function_type").isEmpty()) continue
-            val log = l.optString("log")
+            val status = l.optString("status").ifEmpty { old?.status.orEmpty() }
+            val finalState = status == "finished" || status == "done" || status == "success" || status == "completed" || status == "failed" || status == "error"
+            val act = l.optString("action")
+            val content = l.optString("content")
+            val logField = l.optString("log")
+            val action = if (act.isNotEmpty()) act else if (old != null) old.action else content
+            // finished entries carry the command output / tool result in "content"
+            val log = if (finalState && content.isNotEmpty()) content else if (logField.isNotEmpty()) logField else old?.log.orEmpty()
+            val fn = l.optJSONArray("tool_calls")?.optJSONObject(0)?.optJSONObject("function")
+            val args = fn?.optString("arguments").orEmpty()
+            val tool = fn?.optString("name").orEmpty().ifEmpty { l.optString("tool_name") }
             into[id] = Step(
                 id,
                 l.optString("function_type").ifEmpty { old?.type.orEmpty() },
-                l.optString("action").ifEmpty { l.optString("content").ifEmpty { old?.action.orEmpty() } },
-                if (log.isNotEmpty()) log else old?.log.orEmpty(),
-                l.optString("status").ifEmpty { old?.status.orEmpty() }
+                action, log, status,
+                if (args.isNotEmpty()) args else old?.args.orEmpty(),
+                if (tool.isNotEmpty()) tool else old?.tool.orEmpty()
             )
+        }
+    }
+
+    private class Acc {
+        val files = LinkedHashMap<String, FileChange>()
+        var commit = ""
+    }
+
+    private fun collect(o: Any?, acc: Acc) {
+        when (o) {
+            is JSONObject -> {
+                val keys = o.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = o.opt(k)
+                    if (k == "file_list" && v is JSONArray) {
+                        for (i in 0 until v.length()) {
+                            val f = v.optJSONObject(i) ?: continue
+                            val path = f.optString("path")
+                            if (path.isEmpty()) continue
+                            acc.files[path] = FileChange(path, f.optString("command"), f.optString("old_content").let { if (it == "null") "" else it }, f.optString("new_content").let { if (it == "null") "" else it })
+                        }
+                    } else if (k == "commit_id" && v is String && v.isNotEmpty()) {
+                        acc.commit = v
+                    } else {
+                        collect(v, acc)
+                    }
+                }
+            }
+            is JSONArray -> for (i in 0 until o.length()) collect(o.opt(i), acc)
         }
     }
 
@@ -459,7 +549,9 @@ class Api(ctx: Context) {
                 val err = m.optJSONObject("error")?.let { e ->
                     e.optString("details").ifEmpty { e.optString("code") }
                 }
-                ChatMsg(m.optString("id"), "assistant", answer.toString(), steps.values.toList(), think.toString(), err, m.optBoolean("done"))
+                val acc = Acc()
+                collect(m, acc)
+                ChatMsg(m.optString("id"), "assistant", answer.toString(), steps.values.toList(), think.toString(), err, m.optBoolean("done"), acc.files.values.toList(), acc.commit)
             }
         }
     }

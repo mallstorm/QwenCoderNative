@@ -89,6 +89,16 @@ class MainActivity : Activity() {
     private lateinit var input: EditText
     private lateinit var sendBtn: ImageButton
     private lateinit var micBtn: ImageButton
+    private lateinit var codePanel: CodePanel
+    private lateinit var codeBadge: TextView
+    private lateinit var thinkChip: TextView
+    private lateinit var searchInput: EditText
+    private lateinit var runChip: TextView
+    private lateinit var usageView: TextView
+    private var thinking = false
+    private var onlyRunning = false
+    private var query = ""
+    private var pinnedTasks: List<TaskItem> = emptyList()
 
     private var statusAnim: ObjectAnimator? = null
     private var curId: String? = null
@@ -123,6 +133,7 @@ class MainActivity : Activity() {
         api = Api(this)
         prefs = getSharedPreferences("qc", MODE_PRIVATE)
         selModel = prefs.getString("model", "qwen3-coder-plus") ?: "qwen3-coder-plus"
+        thinking = prefs.getBoolean("think", false)
         window.statusBarColor = Theme.BG
         window.navigationBarColor = Theme.BG
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
@@ -135,6 +146,7 @@ class MainActivity : Activity() {
         setContentView(root)
 
         if (api.loggedIn) showMain() else showLogin()
+        handleIntent(intent)
     }
 
     // ---------- UI helpers ----------
@@ -329,6 +341,18 @@ class MainActivity : Activity() {
         titleBox.addView(titleView)
         titleBox.addView(subRow)
         header.addView(titleBox, lp(0, -2, 1f).apply { leftMargin = dp(10) })
+        val codeWrap = FrameLayout(this)
+        codeWrap.addView(icon(R.drawable.ic_code, "Код и изменения") { openCode() }, FrameLayout.LayoutParams(dp(48), dp(48)))
+        codeBadge = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 9.5f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+            visibility = View.GONE
+        }
+        codeWrap.addView(codeBadge, FrameLayout.LayoutParams(dp(17), dp(17), Gravity.TOP or Gravity.END).apply { topMargin = dp(5); rightMargin = dp(3) })
+        header.addView(codeWrap, lp(dp(48), dp(48)))
         header.addView(icon(R.drawable.ic_add, "Новая задача") { startNewTask() })
         header.addView(icon(R.drawable.ic_more, "Меню") { showMenu() })
         content.addView(header, lp(-1, dp(56)))
@@ -370,7 +394,13 @@ class MainActivity : Activity() {
         }
         repoChip = chip("Без репозитория", R.drawable.ic_repo) { openRepoPicker() }
         modelChip = chip("Qwen3-Coder", R.drawable.ic_sparkle) { openModelPicker() }
+        thinkChip = chip("Думать: выкл", R.drawable.ic_sparkle) {
+            thinking = !thinking
+            prefs.edit().putBoolean("think", thinking).apply()
+            updateChips()
+        }
         chipRow.addView(repoChip, lp(0, -2, 1f).apply { rightMargin = dp(8) })
+        chipRow.addView(thinkChip, lp(-2, -2).apply { rightMargin = dp(8) })
         chipRow.addView(modelChip, lp(-2, -2))
         content.addView(chipRow, lp(-1, -2))
 
@@ -446,9 +476,52 @@ class MainActivity : Activity() {
             rightMargin = dp(14)
             bottomMargin = dp(4)
         })
+        val sr = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(6), dp(14), dp(4))
+        }
+        searchInput = EditText(this).apply {
+            hint = "Поиск задач"
+            setHintTextColor(Theme.MUTED)
+            setTextColor(Theme.TEXT)
+            textSize = 14f
+            maxLines = 1
+            inputType = InputType.TYPE_CLASS_TEXT
+            background = Md.round(Theme.SURFACE2, 14, this@MainActivity)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    query = s?.toString()?.trim().orEmpty()
+                    renderTasks()
+                }
+            })
+        }
+        runChip = TextView(this).apply {
+            text = "Идут"
+            textSize = 12.5f
+            setPadding(dp(11), dp(8), dp(11), dp(8))
+            setOnClickListener {
+                onlyRunning = !onlyRunning
+                styleRunChip()
+                renderTasks()
+            }
+        }
+        styleRunChip()
+        sr.addView(searchInput, lp(0, -2, 1f))
+        sr.addView(runChip, lp(-2, -2).apply { leftMargin = dp(8) })
+        side.addView(sr, lp(-1, -2))
         taskBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         side.addView(ScrollView(this).apply { addView(taskBox, FrameLayout.LayoutParams(-1, -2)) }, lp(-1, 0, 1f))
         side.addView(View(this).apply { setBackgroundColor(Theme.STROKE) }, lp(-1, 1))
+        usageView = TextView(this).apply {
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            setPadding(dp(18), dp(10), dp(18), 0)
+            visibility = View.GONE
+        }
+        side.addView(usageView, lp(-1, -2))
         val acc = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -491,7 +564,110 @@ class MainActivity : Activity() {
         })
         side.addView(acc, lp(-1, -2))
         dl.addView(side, DrawerLayout.LayoutParams(dp(310), -1).apply { gravity = Gravity.START })
+        codePanel = CodePanel(this, { api.changesFromSteps(it) }, { dl.closeDrawer(Gravity.END) }, { openUrl(it) })
+        val pw = minOf((resources.displayMetrics.widthPixels * 0.94f).toInt(), dp(520))
+        dl.addView(codePanel, DrawerLayout.LayoutParams(pw, -1).apply { gravity = Gravity.END })
+        dl.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, Gravity.END)
+        dl.addDrawerListener(object : DrawerLayout.SimpleDrawerListener() {
+            override fun onDrawerOpened(v: View) {
+                if (v === codePanel) {
+                    dl.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_OPEN, Gravity.END)
+                    codePanel.setActive(true)
+                }
+            }
+            override fun onDrawerClosed(v: View) {
+                if (v === codePanel) {
+                    dl.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, Gravity.END)
+                    codePanel.setActive(false)
+                }
+            }
+        })
         return dl
+    }
+
+    private fun styleRunChip() {
+        runChip.setTextColor(if (onlyRunning) Color.WHITE else Theme.MUTED)
+        runChip.background = if (onlyRunning) Md.gradient(this, Theme.ACCENT, Theme.ACCENT2, 14) else Md.round(Theme.SURFACE2, 14, this)
+    }
+
+    private fun openCode(tab: Int = -1) {
+        codePanel.update(curId, thread, live?.steps?.values ?: emptyList())
+        if (tab >= 0) codePanel.showTab(tab)
+        drawer.openDrawer(Gravity.END)
+    }
+
+    private fun loadUsage() {
+        pool.execute {
+            val u = api.usage()
+            ui.post {
+                if (u == null || u.remaining < 0) return@post
+                val reset = if (u.resetAt > 0) " · сброс " + java.text.SimpleDateFormat("d MMM HH:mm", Locale("ru")).format(java.util.Date(u.resetAt)) else ""
+                usageView.text = "Осталось ${u.remaining}% · ${u.member.ifEmpty { "free" }}$reset"
+                usageView.setTextColor(if (u.remaining <= 10) Theme.AMBER else Theme.MUTED)
+                usageView.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun openSettings() {
+        pool.execute {
+            try {
+                val st = api.getSettings()
+                ui.post { settingsDialog(st) }
+            } catch (e: Exception) {
+                ui.post { handleError(e) }
+            }
+        }
+    }
+
+    private fun settingsDialog(st: JSONObject) {
+        val cs = st.optJSONObject("code_settings") ?: JSONObject()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+        fun field(label: String, value: String, multi: Boolean): EditText {
+            box.addView(TextView(this).apply { text = label; textSize = 12f; setPadding(0, dp(10), 0, dp(2)) })
+            val e = EditText(this).apply {
+                setText(value)
+                textSize = 14f
+                if (multi) { minLines = 3; maxLines = 8; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE }
+            }
+            box.addView(e, lp(-1, -2))
+            return e
+        }
+        val prompt = field("Свой промпт для кода", cs.optString("custom_prompt"), true)
+        val branch = field("Формат имени ветки", cs.optString("branch_format"), false)
+        val diff = field("Вид diff (unified / split)", cs.optString("diff_display", "unified"), false)
+        AlertDialog.Builder(this).setTitle("Настройки Qwen Coder").setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Сохранить") { _, _ ->
+                cs.put("custom_prompt", prompt.text.toString())
+                cs.put("branch_format", branch.text.toString())
+                cs.put("diff_display", diff.text.toString().trim().ifEmpty { "unified" })
+                st.put("code_settings", cs)
+                pool.execute {
+                    try {
+                        api.updateSettings(st)
+                        ui.post { toast("Настройки сохранены") }
+                    } catch (e: Exception) {
+                        ui.post { handleError(e) }
+                    }
+                }
+            }
+            .setNegativeButton("Отмена", null).show()
+    }
+
+    private fun handleIntent(i: Intent?) {
+        val id = i?.getStringExtra("task_id") ?: return
+        i.removeExtra("task_id")
+        if (!api.loggedIn) return
+        openTask(id, i.getStringExtra("task_title").orEmpty(), i.getStringExtra("task_repo").orEmpty(), i.getStringExtra("task_branch").orEmpty())
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
     }
 
     private fun buildEmpty(): LinearLayout {
@@ -567,7 +743,9 @@ class MainActivity : Activity() {
         updateHeader()
         render(emptyList())
         loadTasks()
+        loadUsage()
         loadEnvs(false)
+        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 2002)
         pool.execute {
             try {
                 api.me()
@@ -675,6 +853,8 @@ class MainActivity : Activity() {
         }
         repoChip.alpha = if (id != null) 0.7f else 1f
         modelChip.text = modelTitle(selModel)
+        thinkChip.text = if (thinking) "Думать: вкл" else "Думать: выкл"
+        thinkChip.setTextColor(if (thinking) Theme.ACCENT else Theme.TEXT)
     }
 
     private fun modelTitle(id: String): String = models.firstOrNull { it.id == id }?.title ?: id
@@ -1010,8 +1190,10 @@ class MainActivity : Activity() {
         pool.execute {
             try {
                 val t = api.tasks(1)
+                val pn = try { api.pinned() } catch (_: Exception) { emptyList() }
                 ui.post {
                     tasks = t
+                    pinnedTasks = pn
                     renderTasks()
                 }
             } catch (e: Exception) {
@@ -1022,17 +1204,22 @@ class MainActivity : Activity() {
 
     private fun renderTasks() {
         taskBox.removeAllViews()
-        if (tasks.isEmpty()) {
+        val pinIds = pinnedTasks.map { it.id }.toSet()
+        fun ok(t: TaskItem) = (!onlyRunning || t.status == "running") && (query.isEmpty() || t.title.contains(query, true) || t.repo.contains(query, true))
+        val pins = pinnedTasks.filter { ok(it) }
+        val rest = tasks.filter { it.id !in pinIds && ok(it) }
+        val all = pins + rest
+        if (all.isEmpty()) {
             taskBox.addView(TextView(this).apply {
-                text = "Пока нет задач"
+                text = if (tasks.isEmpty()) "Пока нет задач" else "Ничего не найдено"
                 setTextColor(Theme.MUTED)
                 setPadding(dp(18), dp(16), dp(18), dp(12))
             })
             return
         }
         var lastGroup = ""
-        for (t in tasks) {
-            val g = groupOf(t.updatedAt)
+        for (t in all) {
+            val g = if (t.id in pinIds) "Закреплённые" else groupOf(t.updatedAt)
             if (g != lastGroup) {
                 taskBox.addView(sectionLabel(g))
                 lastGroup = g
@@ -1273,6 +1460,10 @@ class MainActivity : Activity() {
             base.add(ChatMsg("wait", "assistant", "", emptyList(), "", null, false))
         }
         render(base)
+        codePanel.update(curId, thread, if (streaming) live?.steps?.values ?: emptyList() else emptyList())
+        val n = codePanel.changeCount
+        codeBadge.visibility = if (n > 0) View.VISIBLE else View.GONE
+        codeBadge.text = if (n > 99) "99" else n.toString()
     }
 
     // ---------- rendering ----------
@@ -1576,10 +1767,11 @@ class MainActivity : Activity() {
         startPolling()
         val parent = leafId
         val mdl = selModel
+        val think = thinking
         pool.execute {
             var err: String? = null
             try {
-                api.stream(id, text, parent, mdl) { data -> ui.post { applyLive(id, data) } }
+                api.stream(id, text, parent, mdl, think) { data -> ui.post { applyLive(id, data) } }
             } catch (e: Exception) {
                 if (!cancelled) {
                     err = e.message ?: e.javaClass.simpleName
@@ -1643,6 +1835,7 @@ class MainActivity : Activity() {
             items.add("Открыть превью проекта" to { openUrl("https://$id.preview.qwenlm.io/") })
             items.add("Открыть задачу на сайте" to { openUrl("https://coder.qwen.ai/c/$id") })
         }
+        items.add("Настройки Qwen Coder" to { openSettings() })
         items.add("Репозитории и GitHub (сайт)" to {
             refreshEnvsOnResume = true
             openUrl("https://coder.qwen.ai/")
@@ -1651,6 +1844,7 @@ class MainActivity : Activity() {
             envs = null
             loadEnvs(true)
             loadTasks()
+            loadUsage()
             if (id != null) fetchDetail(id)
         })
         items.add("Выйти" to { logout() })
@@ -1676,6 +1870,7 @@ class MainActivity : Activity() {
             return
         }
         recognizer?.destroy()
+        codePanel.destroy()
         recognizer = SpeechRecognizer.createSpeechRecognizer(this).also { speech ->
             speech.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {}
@@ -1732,8 +1927,17 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onPause() {
+        WatchService.visible = false
+        if (api.loggedIn && (streaming || running)) WatchService.start(this)
+        super.onPause()
+    }
+
     override fun onResume() {
         super.onResume()
+        WatchService.visible = true
+        WatchService.stop(this)
+        if (api.loggedIn) loadTasks()
         if ((streaming || running) && curId != null) startPolling()
         if (refreshEnvsOnResume && api.loggedIn) {
             refreshEnvsOnResume = false
@@ -1744,7 +1948,7 @@ class MainActivity : Activity() {
 
     @Deprecated("Legacy back handling")
     override fun onBackPressed() {
-        if (drawer.isDrawerOpen(Gravity.START)) drawer.closeDrawers() else super.onBackPressed()
+        if (drawer.isDrawerOpen(Gravity.END) || drawer.isDrawerOpen(Gravity.START)) drawer.closeDrawers() else super.onBackPressed()
     }
 
     override fun onDestroy() {
