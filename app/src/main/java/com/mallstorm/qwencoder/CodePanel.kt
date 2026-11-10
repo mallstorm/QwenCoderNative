@@ -25,14 +25,21 @@ class CodePanel(
     ctx: Context,
     private val changes: (Collection<Step>) -> List<FileChange>,
     private val onClose: () -> Unit,
-    private val onOpenBrowser: (String) -> Unit
+    private val onOpenBrowser: (String) -> Unit,
+    private val onFetch: () -> Unit,
+    private val onStartPreview: () -> Unit,
+    private val onSave: () -> Unit
 ) : LinearLayout(ctx) {
 
     private var tab = 0
     private var files: List<FileChange> = emptyList()
     private var shells: List<Step> = emptyList()
     private var edits: List<Step> = emptyList()
-    @Volatile private var virtual: Map<String, String> = emptyMap()
+    @Volatile private var virtual: Map<String, ByteArray> = emptyMap()
+    private var fromChanges: Map<String, ByteArray> = emptyMap()
+    private var sandbox: Map<String, ByteArray>? = null
+    private var sandboxStatus = ""
+    private var sandboxBusy = false
     private var localMode = false
     private var modeView: TextView? = null
     private var taskId: String? = null
@@ -74,16 +81,17 @@ class CodePanel(
         addView(head, LayoutParams(-1, -2))
 
         val tabs = LinearLayout(ctx).apply { setPadding(dp(12), 0, dp(12), dp(8)) }
-        listOf("Изменения", "Терминал", "Превью").forEachIndexed { i, n ->
+        listOf("Изменения", "Файлы", "Терминал", "Превью").forEachIndexed { i, n ->
             val t = TextView(ctx).apply {
                 text = n
-                textSize = 13f
+                textSize = 12.5f
                 gravity = Gravity.CENTER
-                setPadding(dp(8), dp(8), dp(8), dp(8))
+                maxLines = 1
+                setPadding(dp(4), dp(8), dp(4), dp(8))
                 setOnClickListener { tab = i; styleTabs(); render() }
             }
             tabViews.add(t)
-            tabs.addView(t, LayoutParams(0, -2, 1f).apply { if (i > 0) leftMargin = dp(6) })
+            tabs.addView(t, LayoutParams(0, -2, 1f).apply { if (i > 0) leftMargin = dp(5) })
         }
         addView(tabs, LayoutParams(-1, -2))
         addView(View(ctx).apply { setBackgroundColor(Theme.STROKE) }, LayoutParams(-1, 1))
@@ -120,15 +128,42 @@ class CodePanel(
         files = f.values.toList()
         shells = sh.values.toList()
         edits = all.filter { it.type.equals("Edit", true) && (it.action.startsWith("edit") || it.action.startsWith("create") || it.action.startsWith("write")) }
-        virtual = f.filter { it.value.full }.mapValues { it.value.newText }
+        fromChanges = f.filter { it.value.full }.mapValues { it.value.newText.toByteArray() }
+        mergeVirtual()
         commit = cm
-        if (taskId != id) localMode = false
+        if (taskId != id) {
+            localMode = false
+            expanded.clear()
+        }
         taskId = id
-        val s = "$id|${files.size}|${files.sumOf { it.newText.length + it.oldText.length }}|${shells.size}|${shells.lastOrNull()?.log?.length}|${shells.lastOrNull()?.status}|${edits.size}"
+        val s = "$id|${files.size}|${files.sumOf { it.newText.length + it.oldText.length }}|${shells.size}|${shells.lastOrNull()?.log?.length}|${shells.lastOrNull()?.status}|${edits.size}|${sandbox?.size}|$sandboxStatus|$sandboxBusy"
         if (s == sig) return
         sig = s
         titleView.text = if (files.isEmpty()) "Код" else "Код · ${files.size} ${if (files.size == 1) "файл" else "файлов"}"
-        if (active && tab != 2) render()
+        if (active && tab != 3) render()
+    }
+
+    private fun mergeVirtual() {
+        val m = LinkedHashMap<String, ByteArray>(fromChanges)
+        sandbox?.let { m.putAll(it) }
+        virtual = m
+    }
+
+    /** Files unpacked from the sandbox (null = not fetched yet). */
+    fun setSandbox(files: Map<String, ByteArray>?, status: String, busy: Boolean) {
+        sandbox = files
+        sandboxStatus = status
+        sandboxBusy = busy
+        mergeVirtual()
+        sig = ""
+        if (active && tab == 1) render()
+    }
+
+    fun reloadPreview() {
+        localMode = false
+        modeView?.text = ""
+        val id = taskId ?: return
+        web?.loadUrl("https://$id.preview.qwenlm.io/")
     }
 
     private fun norm(p: String) = p.removePrefix("/workspace/").removePrefix("./")
@@ -147,7 +182,8 @@ class CodePanel(
     private fun render() {
         when (tab) {
             0 -> renderChanges()
-            1 -> renderTerminal()
+            1 -> renderFiles()
+            2 -> renderTerminal()
             else -> renderPreview()
         }
     }
@@ -341,6 +377,101 @@ class CodePanel(
         }
     }
 
+    private fun renderFiles() {
+        val box = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(24))
+        }
+        val sb = sandbox
+        val head = LinearLayout(context).apply {
+            orientation = VERTICAL
+            background = Md.round(Theme.SURFACE, 14, context, Theme.STROKE)
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+        }
+        head.addView(TextView(context).apply {
+            text = when {
+                taskId == null -> "Файлы доступны внутри задачи."
+                sandboxBusy -> "Агент выгружает файлы из песочницы…"
+                sandboxStatus.isNotEmpty() -> sandboxStatus
+                sb == null -> "Файлы проекта лежат в песочнице Qwen. Приложение попросит агента упаковать их и вывести в терминал, затем соберёт архив у себя. Это обычный запрос к агенту: он тратит кредиты и занимает пару минут."
+                else -> "Из песочницы: ${sb.size} файл., ${sb.values.sumOf { it.size } / 1024} КБ"
+            }
+            setTextColor(Theme.MUTED)
+            textSize = 13f
+        })
+        if (taskId != null && !sandboxBusy) {
+            val row = LinearLayout(context).apply { setPadding(0, dp(10), 0, 0) }
+            row.addView(TextView(context).apply {
+                text = if (sb == null) "Получить из песочницы" else "Обновить"
+                setTextColor(Color.WHITE)
+                textSize = 13.5f
+                gravity = Gravity.CENTER
+                background = Md.gradient(context, Theme.ACCENT, Theme.ACCENT2, 12)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setOnClickListener { onFetch() }
+            }, LayoutParams(0, -2, 1f))
+            if (sb != null) row.addView(TextView(context).apply {
+                text = "Сохранить архив"
+                setTextColor(Theme.ACCENT)
+                textSize = 13.5f
+                gravity = Gravity.CENTER
+                background = Md.round(Theme.SURFACE2, 12, context)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setOnClickListener { onSave() }
+            }, LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) })
+            head.addView(row, LayoutParams(-1, -2))
+        }
+        box.addView(head, LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+        if (sb != null) {
+            for ((path, bytes) in sb) {
+                val key = "f:$path"
+                val card = LinearLayout(context).apply {
+                    orientation = VERTICAL
+                    background = Md.round(Theme.SURFACE, 12, context, Theme.STROKE)
+                }
+                val row = LinearLayout(context).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = Md.rippleRect(null)
+                    setPadding(dp(12), dp(10), dp(12), dp(10))
+                    setOnClickListener {
+                        if (!expanded.add(key)) expanded.remove(key)
+                        render()
+                    }
+                }
+                row.addView(TextView(context).apply {
+                    text = path
+                    setTextColor(Theme.TEXT)
+                    typeface = Typeface.MONOSPACE
+                    textSize = 12.5f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.START
+                }, LayoutParams(0, -2, 1f))
+                row.addView(TextView(context).apply {
+                    text = if (bytes.size < 1024) "${bytes.size} Б" else "${bytes.size / 1024} КБ"
+                    setTextColor(Theme.MUTED)
+                    textSize = 11.5f
+                    setPadding(dp(8), 0, 0, 0)
+                })
+                card.addView(row, LayoutParams(-1, -2))
+                if (expanded.contains(key)) {
+                    if (Sandbox.isText(bytes)) {
+                        val t = String(bytes, Charsets.UTF_8)
+                        card.addView(Md.codeBlock(context, if (t.length > 60000) t.take(60000) + "\n…" else t, path.substringAfterLast('.', "")))
+                    } else {
+                        card.addView(TextView(context).apply {
+                            text = "Бинарный файл"
+                            setTextColor(Theme.MUTED)
+                            textSize = 12.5f
+                            setPadding(dp(12), 0, dp(12), dp(10))
+                        })
+                    }
+                }
+                box.addView(card, LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
+            }
+        }
+        scrollOf(box)
+    }
+
     private fun renderTerminal() {
         val box = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -354,7 +485,7 @@ class CodePanel(
                 sb.append("$ ")
                 sb.append(s.action.trim())
                 sb.setSpan(ForegroundColorSpan(Theme.GREEN), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                val out = s.log.trim()
+                val out = Sandbox.prettyLog(s.log).trim()
                 if (out.isNotEmpty()) {
                     sb.append("\n")
                     val a = sb.length
@@ -389,6 +520,13 @@ class CodePanel(
         "js", "mjs" -> "application/javascript"
         "json" -> "application/json"
         "svg" -> "image/svg+xml"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "ico" -> "image/x-icon"
+        "woff2" -> "font/woff2"
+        "woff" -> "font/woff"
         else -> "text/plain"
     }
 
@@ -398,7 +536,7 @@ class CodePanel(
         val idx = localIndex()
         if (idx == null) {
             modeView?.text = ""
-            v.loadDataWithBaseURL(null, messagePage("Превью недоступно.<br>В задаче не запущен веб-сервер, а HTML-файлов среди изменений нет.<br><br>Попросите агента: «запусти проект для превью»."), "text/html", "utf-8", null)
+            v.loadDataWithBaseURL(null, messagePage("Превью недоступно: в песочнице не запущен веб-сервер.<br><br>Нажмите «Запустить» — агент поднимет сервер превью.<br>Или откройте вкладку «Файлы» и получите файлы — тогда страница откроется прямо в приложении."), "text/html", "utf-8", null)
         } else {
             localMode = true
             modeView?.text = "локально, из файлов задачи"
@@ -437,6 +575,13 @@ class CodePanel(
             setPadding(0, dp(6), dp(16), dp(6))
             setOnClickListener { onOpenBrowser(url) }
         })
+        bar.addView(TextView(context).apply {
+            text = "Запустить"
+            setTextColor(Theme.ACCENT)
+            textSize = 13f
+            setPadding(0, dp(6), dp(16), dp(6))
+            setOnClickListener { onStartPreview() }
+        })
         modeView = TextView(context).apply {
             setTextColor(Theme.MUTED)
             textSize = 12f
@@ -470,7 +615,7 @@ class CodePanel(
                             ?: files.keys.firstOrNull { it.endsWith("/$path") }
                         val data = if (key != null) files[key] else null
                         return if (data != null) {
-                            android.webkit.WebResourceResponse(mime(key!!), "utf-8", java.io.ByteArrayInputStream(data.toByteArray()))
+                            android.webkit.WebResourceResponse(mime(key!!), "utf-8", java.io.ByteArrayInputStream(data))
                         } else {
                             android.webkit.WebResourceResponse("text/plain", "utf-8", 404, "Not Found", HashMap(), java.io.ByteArrayInputStream(ByteArray(0)))
                         }

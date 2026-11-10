@@ -100,6 +100,9 @@ class MainActivity : Activity() {
     private var onlyRunning = false
     private var query = ""
     private var pinnedTasks: List<TaskItem> = emptyList()
+    private var sandboxFiles: LinkedHashMap<String, ByteArray>? = null
+    private var fetchWaiting = false
+    private var previewWaiting = false
 
     private var statusAnim: ObjectAnimator? = null
     private var curId: String? = null
@@ -581,7 +584,7 @@ class MainActivity : Activity() {
         })
         side.addView(acc, lp(-1, -2))
         dl.addView(side, DrawerLayout.LayoutParams(dp(310), -1).apply { gravity = Gravity.START })
-        codePanel = CodePanel(this, { api.changesFromSteps(it) }, { dl.closeDrawer(Gravity.END) }, { openUrl(it) })
+        codePanel = CodePanel(this, { api.changesFromSteps(it) }, { dl.closeDrawer(Gravity.END) }, { openUrl(it) }, { fetchSandbox() }, { startPreviewServer() }, { saveSandbox() })
         val pw = minOf((resources.displayMetrics.widthPixels * 0.94f).toInt(), dp(520))
         dl.addView(codePanel, DrawerLayout.LayoutParams(pw, -1).apply { gravity = Gravity.END })
         dl.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, Gravity.END)
@@ -1458,6 +1461,10 @@ class MainActivity : Activity() {
         running = false
         cancelled = false
         openSteps.clear()
+        fetchWaiting = false
+        previewWaiting = false
+        sandboxFiles = if (id != null) Sandbox.loadCache(this, id) else null
+        codePanel.setSandbox(sandboxFiles, "", false)
         updateSend()
         updateHeader()
         updateChips()
@@ -1560,6 +1567,91 @@ class MainActivity : Activity() {
         updateHeader()
         updateChips()
         rebuildDisplay()
+        if (!running && !streaming) checkSandbox()
+    }
+
+    // ---------- sandbox ----------
+
+    private fun agentBusy(): Boolean {
+        if (curId == null) { toast("Сначала откройте задачу"); return true }
+        if (streaming || running) { toast("Дождитесь, пока агент закончит текущую работу"); return true }
+        return false
+    }
+
+    private fun fetchSandbox() {
+        val id = curId
+        if (agentBusy() || id == null) return
+        fetchWaiting = true
+        codePanel.setSandbox(sandboxFiles, "", true)
+        startStream(id, Sandbox.fetchPrompt())
+    }
+
+    private fun startPreviewServer() {
+        val id = curId
+        if (agentBusy() || id == null) return
+        toast("Агент запускает сервер превью…")
+        pool.execute {
+            val port = api.sandboxPort(id)
+            ui.post {
+                if (curId != id) return@post
+                previewWaiting = true
+                startStream(id, Sandbox.previewPrompt(port))
+            }
+        }
+    }
+
+    private fun checkSandbox() {
+        val id = curId ?: return
+        if (previewWaiting && thread.lastOrNull()?.role == "assistant") {
+            previewWaiting = false
+            codePanel.reloadPreview()
+            toast("Сервер превью запущен — откройте «Превью»")
+        }
+        if (!fetchWaiting && sandboxFiles != null) return
+        val r = Sandbox.extract(thread)
+        if (r == null) {
+            if (fetchWaiting) { fetchWaiting = false; codePanel.setSandbox(sandboxFiles, "Запрос не найден в истории. Попробуйте ещё раз.", false) }
+            return
+        }
+        val files = r.files
+        if (files != null) {
+            val was = fetchWaiting
+            fetchWaiting = false
+            sandboxFiles = files
+            codePanel.setSandbox(files, "", false)
+            pool.execute { Sandbox.saveCache(this, id, files) }
+            if (was) toast("Получено файлов: ${files.size}")
+        } else if (fetchWaiting) {
+            fetchWaiting = false
+            val msg = if (r.total == 0) "Агент не вывел архив. Нажмите «Получить из песочницы» ещё раз."
+            else "Получено частей ${r.got} из ${r.total}. Нажмите кнопку ещё раз, чтобы повторить."
+            codePanel.setSandbox(sandboxFiles, msg, false)
+        }
+    }
+
+    private fun saveDownload(name: String, mime: String, bytes: ByteArray): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 29) return false
+        val cv = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+            put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
+        }
+        val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: return false
+        contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: return false
+        return true
+    }
+
+    private fun saveSandbox() {
+        val files = sandboxFiles ?: return
+        val id = curId ?: return
+        pool.execute {
+            try {
+                val name = "qwen-${curTitle.ifEmpty { id.take(8) }.replace(Regex("[^\\p{L}\\p{N}_-]+"), "-").take(40)}.tar.gz"
+                val ok = saveDownload(name, "application/gzip", Sandbox.packTgz(files))
+                ui.post { toast(if (ok) "Сохранено в Загрузки: $name" else "Сохранение доступно на Android 10+") }
+            } catch (e: Exception) {
+                ui.post { toast("Не удалось сохранить: ${e.message}") }
+            }
+        }
     }
 
     private val poll = object : Runnable {
@@ -1647,6 +1739,20 @@ class MainActivity : Activity() {
     private fun makeView(m: ChatMsg): View = if (m.role == "user") userView(m) else assistantView(m)
 
     private fun userView(m: ChatMsg): View {
+        if (Sandbox.isService(m.text)) {
+            val w = LinearLayout(this).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                layoutParams = lp(-1, -2).apply { bottomMargin = dp(14) }
+            }
+            w.addView(TextView(this).apply {
+                text = if (Sandbox.isFetch(m.text)) "⚙  Запрос файлов из песочницы" else "⚙  Запуск сервера превью"
+                setTextColor(Theme.MUTED)
+                textSize = 12.5f
+                background = Md.round(Theme.SURFACE2, 14, this@MainActivity, Theme.STROKE)
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+            })
+            return w
+        }
         val wrap = LinearLayout(this).apply {
             gravity = Gravity.END
             layoutParams = lp(-1, -2).apply { bottomMargin = dp(16) }
@@ -1812,7 +1918,7 @@ class MainActivity : Activity() {
             val bad = s.status == "failed" || s.status == "error"
             val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             val logView = TextView(this).apply {
-                text = if (s.log.length > 6000) s.log.take(6000) + "\n…" else s.log.ifEmpty { "(нет вывода)" }
+                text = Sandbox.prettyLog(s.log).let { if (it.length > 6000) it.take(6000) + "\n…" else it.ifEmpty { "(нет вывода)" } }
                 typeface = Typeface.MONOSPACE
                 textSize = 11.5f
                 setTextColor(Theme.CODE_FG)
@@ -2024,7 +2130,8 @@ class MainActivity : Activity() {
             }
             item("Настройки", "Тема, размер текста, настройки Qwen Coder") { openSettings() }
             if (id != null) {
-                item("Превью проекта", "Открыть в окне кода") { openCode(2) }
+                item("Превью проекта", "Открыть в окне кода") { openCode(3) }
+                item("Файлы из песочницы", "Выгрузить проект через агента") { openCode(1) }
                 item("Открыть задачу на сайте") { openUrl("https://coder.qwen.ai/c/$id") }
                 item("Сохранить данные задачи", "Файл JSON в «Загрузки» для отладки") { exportTask(id) }
             }

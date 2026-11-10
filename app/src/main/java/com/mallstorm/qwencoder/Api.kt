@@ -375,6 +375,14 @@ class Api(ctx: Context) {
     fun taskDetail(id: String): JSONObject =
         call("GET", "$CODER/coder/api/v2/task/$id").optJSONObject("data") ?: JSONObject()
 
+    /** Port of the sandbox dev server (previewUrl is http://localhost:PORT). */
+    fun sandboxPort(id: String): Int = try {
+        val u = call("GET", "$CODER/coder/api/v2/task/sandbox/session?task_id=$id").optJSONObject("data")?.optString("previewUrl").orEmpty()
+        Regex(":(\\d+)").find(u)?.groupValues?.get(1)?.toInt() ?: 4001
+    } catch (_: Exception) {
+        4001
+    }
+
     fun taskStatus(id: String): String =
         call("GET", "$CODER/coder/api/v2/task/$id/status").optJSONObject("data")?.optString("status").orEmpty()
 
