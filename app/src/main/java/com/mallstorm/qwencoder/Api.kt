@@ -37,7 +37,7 @@ data class Usage(val remaining: Int, val status: String, val member: String, val
 data class ChatMsg(
     val id: String, val role: String, val text: String, val steps: List<Step>,
     val thinking: String, val error: String?, val done: Boolean,
-    val files: List<FileChange> = emptyList(), val commit: String = ""
+    val files: List<FileChange> = emptyList(), val commit: String = "", val work: String = ""
 )
 
 /** Extracts Qwen tokens from whatever the user pastes (raw JWT, "refresh_token=...", Cookie header, JSON export). */
@@ -626,6 +626,44 @@ class Api(ctx: Context) {
                 c.disconnect()
             }
         }
+    }
+
+    /** Re-attaches to a running response; the server replays it from the start (used after the app was away). */
+    fun attach(chatId: String, responseId: String, onData: (String) -> Unit) {
+        val c = open("GET", "$CODER/coder/api/v2/task/completions?chat_id=$chatId&response_id=$responseId", ensureAccess(), true, null)
+        sseConn = c
+        try {
+            val code = c.responseCode
+            saveCookies(c)
+            if (code !in 200..299 || !c.contentType.orEmpty().contains("event-stream")) {
+                fail(Raw(code, (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""))
+            }
+            BufferedReader(InputStreamReader(c.inputStream, Charsets.UTF_8)).use { r ->
+                while (true) {
+                    val line = r.readLine() ?: break
+                    if (line.startsWith("data:")) {
+                        val d = line.substring(5).trim()
+                        if (d.isNotEmpty() && d != "[DONE]") onData(d)
+                    }
+                }
+            }
+        } finally {
+            sseConn = null
+            c.disconnect()
+        }
+    }
+
+    /** One tool step from the live stream (delta.extra.function). */
+    fun mergeStreamStep(into: LinkedHashMap<String, Step>, fn: JSONObject, content: String) {
+        val id = fn.optString("function_id")
+        if (id.isEmpty()) return
+        val old = into[id]
+        val status = fn.optString("status").ifEmpty { old?.status.orEmpty() }
+        val fin = status == "finished" || status == "failed" || status == "error"
+        val action = fn.optString("action").ifEmpty { old?.action ?: content }
+        val out = fn.optString("content").ifEmpty { if (fin) content else "" }
+        into[id] = Step(id, fn.optString("function_type").ifEmpty { old?.type.orEmpty() }, action,
+            if (out.isNotEmpty()) out else old?.log.orEmpty(), status, old?.args.orEmpty(), old?.tool.orEmpty())
     }
 
     fun cancelStream() {

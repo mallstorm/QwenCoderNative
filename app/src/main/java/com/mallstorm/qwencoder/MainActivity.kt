@@ -51,6 +51,8 @@ class MainActivity : Activity() {
         val answer = StringBuilder()
         val think = StringBuilder()
         val steps = LinkedHashMap<String, Step>()
+        val work = StringBuilder()
+        var respId = ""
         var error: String? = null
     }
 
@@ -103,6 +105,8 @@ class MainActivity : Activity() {
     private var sandboxFiles: LinkedHashMap<String, ByteArray>? = null
     private var fetchWaiting = false
     private var adding = false
+    @Volatile private var attached = false
+    private var attachId = ""
     private lateinit var cancelAddBtn: TextView
     private var previewWaiting = false
 
@@ -1716,6 +1720,7 @@ class MainActivity : Activity() {
         curId = id
         curTitle = title
         curRepo = listOf(repo, branch).filter { it.isNotEmpty() }.joinToString(" · ")
+        if (attached) { api.cancelStream(); attached = false; attachId = "" }
         thread = emptyList()
         leafId = null
         live = null
@@ -1805,7 +1810,15 @@ class MainActivity : Activity() {
                     if (curId == id) {
                         running = st == "running"
                         applyDetail(d)
-                        if (running) startPolling()
+                        if (running) {
+                            startPolling()
+                            if (!streaming && !attached) {
+                                val hist = d.optJSONObject("task")?.optJSONObject("history")
+                                val rid = hist?.optString("currentId").orEmpty()
+                                val last = hist?.optJSONObject("messages")?.optJSONObject(rid)
+                                if (last != null && last.optString("role") == "assistant" && !last.optBoolean("done")) attachLive(id, rid)
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -1815,7 +1828,7 @@ class MainActivity : Activity() {
     }
 
     private fun applyDetail(d: JSONObject) {
-        thread = api.parseThread(d)
+        thread = withWork(api.parseThread(d))
         leafId = thread.lastOrNull()?.id
         val tail = thread.lastOrNull()
         if (tail != null && tail.role == "assistant" && tail.done) running = false
@@ -1961,12 +1974,12 @@ class MainActivity : Activity() {
         val p2 = pending
         if (p2 != null) base.add(ChatMsg("pending", "user", p2, emptyList(), "", null, true))
         val lv = live
-        if (streaming && lv != null) {
-            val lm = ChatMsg("live", "assistant", lv.answer.toString(), lv.steps.values.toList(), lv.think.toString(), lv.error, false)
+        if ((streaming || attached) && lv != null) {
+            val lm = ChatMsg("live", "assistant", lv.answer.toString(), lv.steps.values.toList(), lv.think.toString(), lv.error, false, emptyList(), "", lv.work.toString())
             val last = base.lastOrNull()
             if (last == null || last.role == "user") {
                 base.add(lm)
-            } else if (!(last.text.length >= lm.text.length && last.steps.size >= lm.steps.size)) {
+            } else if (!(last.text.length >= lm.text.length && last.steps.size >= lm.steps.size && last.work.length >= lm.work.length)) {
                 base[base.size - 1] = lm.copy(id = last.id)
             }
         } else if (running && base.lastOrNull()?.role == "user") {
@@ -2053,6 +2066,7 @@ class MainActivity : Activity() {
         col.addView(head)
         if (m.thinking.isNotBlank()) col.addView(thinkingView(m))
         if (m.steps.isNotEmpty()) col.addView(stepsView(m))
+        if (m.work.isNotBlank()) col.addView(workView(m))
         if (m.text.isNotBlank()) {
             val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             Md.render(this, box, m.text)
@@ -2109,6 +2123,38 @@ class MainActivity : Activity() {
             }
         })
         return tv
+    }
+
+    /** Long report the agent wrote while working; Qwen replaces it with a short summary in the saved task. */
+    private fun workView(m: ChatMsg): View {
+        val key = "work:" + m.id
+        val open = (m.text.isBlank() || !m.done) != cardToggled.contains(key)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Md.round(Theme.SURFACE, 12, this@MainActivity, Theme.STROKE)
+            setPadding(dp(12), dp(8), dp(12), dp(10))
+            layoutParams = lp(-1, -2).apply { bottomMargin = dp(10) }
+        }
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(8), 0, 0) }
+        var rendered = false
+        fun fill() { if (!rendered) { rendered = true; Md.render(this@MainActivity, body, m.work) } }
+        card.addView(TextView(this).apply {
+            text = if (open) "Подробный отчёт  ▴" else "Подробный отчёт  ▾"
+            setTextColor(Theme.MUTED)
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(2), 0, dp(2))
+            setOnClickListener {
+                val show = body.visibility != View.VISIBLE
+                if (show) { fill(); body.visibility = View.VISIBLE } else body.visibility = View.GONE
+                text = if (show) "Подробный отчёт  ▴" else "Подробный отчёт  ▾"
+                if (!cardToggled.add(key)) cardToggled.remove(key)
+            }
+        })
+        if (open) fill()
+        body.visibility = if (open) View.VISIBLE else View.GONE
+        card.addView(body)
+        return card
     }
 
     private fun thinkingView(m: ChatMsg): View {
@@ -2310,6 +2356,7 @@ class MainActivity : Activity() {
                 if (curId == id) {
                     streaming = false
                     updateSend()
+                    live?.let { saveWork(it.respId, it.work.toString()) }
                     if (errMsg != null) toast(errMsg)
                     fetchDetail(id)
                     loadTasks()
@@ -2323,20 +2370,69 @@ class MainActivity : Activity() {
         val lv = live ?: return
         try {
             val j = JSONObject(data)
+            j.optString("response_id").let { if (it.isNotEmpty()) lv.respId = it }
             j.optJSONObject("error")?.let { e -> lv.error = e.optString("details").ifEmpty { e.optString("code") } }
             val delta = j.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")
             if (delta != null) {
                 val phase = delta.optString("phase").ifEmpty { "answer" }
+                val role = delta.optString("role")
                 val content = delta.optString("content")
+                val fn = delta.optJSONObject("extra")?.optJSONObject("function")
                 when {
+                    fn != null -> api.mergeStreamStep(lv.steps, fn, content)
                     phase == "answer" -> lv.answer.append(content)
                     phase.startsWith("think") -> lv.think.append(content)
+                    phase == "KeepAlive" || role == "function" -> {}
+                    role == "assistant" && phase == "code_working" -> lv.work.append(content)
                     else -> api.mergeSteps(lv.steps, delta.optJSONObject("extra")?.optJSONArray("log_list"))
                 }
             }
         } catch (_: Exception) {
         }
         scheduleRender()
+    }
+
+    // ---------- long reports (assistant text streamed during work, absent from the saved task) ----------
+
+    private fun workPrefs() = getSharedPreferences("qc_work", MODE_PRIVATE)
+
+    private fun saveWork(id: String, text: String) {
+        if (id.isEmpty() || text.isBlank()) return
+        val p = workPrefs()
+        val order = (p.getString("order", "") ?: "").split(',').filter { it.isNotEmpty() && it != id }.toMutableList()
+        order.add(id)
+        val e = p.edit().putString("w_$id", text)
+        while (order.size > 40) e.remove("w_" + order.removeAt(0))
+        e.putString("order", order.joinToString(",")).apply()
+    }
+
+    private fun withWork(list: List<ChatMsg>): List<ChatMsg> {
+        val p = workPrefs()
+        return list.map { m -> if (m.role == "assistant" && m.work.isEmpty()) p.getString("w_" + m.id, null)?.let { m.copy(work = it) } ?: m else m }
+    }
+
+    private fun attachLive(id: String, rid: String) {
+        if (attached || streaming || rid.isEmpty()) return
+        attached = true
+        attachId = id
+        cancelled = false
+        live = Live().also { it.respId = rid }
+        rebuildDisplay()
+        pool.execute {
+            try {
+                api.attach(id, rid) { data -> ui.post { applyLive(id, data) } }
+            } catch (e: Exception) {
+                if (e is ApiError && e.code == "auth") ui.post { handleError(e) }
+            }
+            ui.post {
+                if (attachId == id) attached = false
+                if (curId == id) {
+                    live?.let { saveWork(it.respId, it.work.toString()) }
+                    fetchDetail(id)
+                    loadTasks()
+                }
+            }
+        }
     }
 
     // ---------- menu ----------
