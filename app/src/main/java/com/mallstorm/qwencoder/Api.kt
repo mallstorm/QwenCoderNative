@@ -28,6 +28,11 @@ data class Step(
     val args: String = "", val tool: String = ""
 )
 data class FileChange(val path: String, val command: String, val oldText: String, val newText: String, val pending: Boolean = false, val full: Boolean = true)
+data class GhAccount(val installationId: Long, val login: String, val type: String)
+data class GhRepo(
+    val id: Long, val fullName: String, val name: String, val isPrivate: Boolean,
+    val description: String, val language: String, val pushed: String
+)
 data class Usage(val remaining: Int, val status: String, val member: String, val resetAt: Long)
 data class ChatMsg(
     val id: String, val role: String, val text: String, val steps: List<Step>,
@@ -68,7 +73,8 @@ class Api(ctx: Context) {
     companion object {
         const val CODER = "https://coder.qwen.ai"
         const val AUTH = "https://auth.qwen.ai"
-        const val VERSION = "0.0.33"
+        const val VERSION = "0.0.34"
+        const val GH_REDIRECT = "https://coder.qwen.ai/setting/caenvironment/new"
         const val UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     }
 
@@ -278,6 +284,42 @@ class Api(ctx: Context) {
             ?.optString("connection_status")?.let { it == "connected" }
     } catch (_: Exception) {
         null
+    }
+
+    /** GitHub accounts (app installations) connected to Qwen Coder. */
+    fun githubAccounts(): List<GhAccount> {
+        val arr = call("GET", "$CODER/coder/api/v2/github/organizations").optJSONObject("data")?.optJSONArray("memberships") ?: return emptyList()
+        return (0 until arr.length()).map {
+            val m = arr.getJSONObject(it)
+            GhAccount(m.optLong("installation_id"), m.optString("account_login"), m.optString("account_type"))
+        }
+    }
+
+    fun githubRepos(installationId: Long): List<GhRepo> {
+        val arr = call("GET", "$CODER/coder/api/v2/github/installations/$installationId/repositories").optJSONObject("data")?.optJSONArray("repositories") ?: return emptyList()
+        fun s(o: JSONObject, k: String) = if (o.isNull(k)) "" else o.optString(k)
+        return (0 until arr.length()).map {
+            val r = arr.getJSONObject(it)
+            GhRepo(r.optLong("id"), s(r, "full_name"), s(r, "name"), r.optBoolean("private"), s(r, "description"), s(r, "language"), s(r, "pushed_at"))
+        }.sortedByDescending { it.pushed }
+    }
+
+    /** Adds a GitHub repository to Qwen Coder (creates an environment). */
+    fun createEnvironment(repo: GhRepo, installationId: Long): Env {
+        val body = JSONObject().put("name", repo.name).put("description", "").put("env_vars", JSONObject())
+            .put("setup_script", "").put("repo_id", repo.id.toString()).put("repo_owner_id", installationId.toString())
+        val d = call("POST", "$CODER/coder/api/v2/environments/create", body).optJSONObject("data") ?: throw ApiError("parse", "Пустой ответ")
+        return parseEnv(d)
+    }
+
+    fun githubInstallUrl(): String {
+        val redirect = java.net.URLEncoder.encode(GH_REDIRECT, "UTF-8")
+        return call("GET", "$CODER/coder/api/v2/github/install/url?redirect_uri=$redirect").optJSONObject("data")?.optString("redirect_url").orEmpty()
+    }
+
+    fun githubValidate(code: String, installationId: String, setupAction: String, state: String) {
+        call("POST", "$CODER/coder/api/v2/github/validate", JSONObject().put("code", code)
+            .put("installation_id", installationId).put("setup_action", setupAction).put("state", state))
     }
 
     fun running(): List<TaskItem> {

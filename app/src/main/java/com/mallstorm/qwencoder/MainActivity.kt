@@ -1132,7 +1132,7 @@ class MainActivity : Activity() {
                 val gh = TextView(this).apply {
                     text = when (ghState) {
                         true -> "Аккаунт GitHub подключён к Qwen Coder"
-                        false -> "GitHub не подключён к Qwen Coder. Подключите его на сайте"
+                        false -> "GitHub не подключён к Qwen Coder"
                         null -> "Проверяю подключение GitHub…"
                     }
                     setTextColor(if (ghState == false) Theme.AMBER else Theme.MUTED)
@@ -1140,10 +1140,19 @@ class MainActivity : Activity() {
                     setPadding(dp(18), 0, dp(18), dp(8))
                 }
                 listBox.addView(gh)
-                listBox.addView(outlineButton("Добавить репозиторий на сайте Qwen") {
-                    refreshEnvsOnResume = true
-                    openUrl("https://coder.qwen.ai/")
-                    dlg.dismiss()
+                val onAdded: (Env) -> Unit = { env ->
+                    envs = null
+                    loadEnvs(true) {
+                        if (dlg.isShowing) {
+                            pickedEnv = envs?.firstOrNull { it.id == env.id } ?: env
+                            filter = ""
+                            search.setText("")
+                            showBranches()
+                        }
+                    }
+                }
+                listBox.addView(gradientButton(if (ghState == false) "Подключить GitHub" else "+  Добавить репозиторий из GitHub") {
+                    if (ghState == false) connectGithub { openGithubAdd(onAdded) } else openGithubAdd(onAdded)
                 }, lp(-1, -2).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(4) })
                 listBox.addView(outlineButton("Обновить список") {
                     envs = null
@@ -1232,6 +1241,178 @@ class MainActivity : Activity() {
     }
 
     // ---------- models ----------
+
+    private fun fullDialog(title: String): Triple<Dialog, LinearLayout, TextView> {
+        val dlg = Dialog(this, dlgTheme())
+        dlg.window?.setBackgroundDrawable(ColorDrawable(Theme.BG))
+        dlg.window?.statusBarColor = Theme.BG
+        dlg.window?.navigationBarColor = Theme.BG
+        dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        if (Theme.light) dlg.window?.decorView?.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Theme.BG) }
+        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(4), 0, dp(12), 0) }
+        bar.addView(icon(R.drawable.ic_back, "Назад") { dlg.dismiss() })
+        val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        tb.addView(TextView(this).apply { text = title; setTextColor(Theme.TEXT); textSize = 17f; typeface = Typeface.DEFAULT_BOLD })
+        val sub = TextView(this).apply { setTextColor(Theme.MUTED); textSize = 12f; visibility = View.GONE }
+        tb.addView(sub)
+        bar.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(6) })
+        root.addView(bar, lp(-1, dp(56)))
+        root.addView(View(this).apply { setBackgroundColor(Theme.STROKE) }, lp(-1, 1))
+        dlg.setContentView(root)
+        return Triple(dlg, root, sub)
+    }
+
+    /** Lists repositories of the connected GitHub account and adds the chosen one to Qwen Coder. */
+    private fun openGithubAdd(onAdded: (Env) -> Unit) {
+        val (dlg, root, sub) = fullDialog("Репозитории GitHub")
+        val search = EditText(this).apply {
+            hint = "Поиск репозитория"
+            setHintTextColor(Theme.MUTED); setTextColor(Theme.TEXT); textSize = 14.5f
+            setSingleLine(); inputType = InputType.TYPE_CLASS_TEXT
+            background = Md.round(Theme.SURFACE2, 14, this@MainActivity)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        root.addView(search, lp(-1, -2).apply { setMargins(dp(14), dp(10), dp(14), dp(6)) })
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), 0, dp(8), dp(24)) }
+        root.addView(ScrollView(this).apply { addView(box) }, lp(-1, 0, 1f))
+        var repos: List<Pair<GhAccount, GhRepo>>? = null
+        var err: String? = null
+        var busy: Long = 0
+        fun note(t: String, c: Int = Theme.MUTED) = TextView(this).apply { text = t; setTextColor(c); textSize = 13.5f; setPadding(dp(12), dp(16), dp(12), dp(8)) }
+        lateinit var draw: () -> Unit
+        fun load() {
+            repos = null; err = null; draw()
+            pool.execute {
+                try {
+                    val acc = api.githubAccounts()
+                    val list = acc.flatMap { a -> api.githubRepos(a.installationId).map { a to it } }
+                    ui.post {
+                        repos = list
+                        sub.text = if (acc.isEmpty()) "GitHub не подключён" else acc.joinToString(", ") { "@" + it.login }
+                        sub.visibility = View.VISIBLE
+                        draw()
+                    }
+                } catch (e: Exception) {
+                    ui.post { err = e.message ?: "Ошибка"; draw() }
+                }
+            }
+        }
+        draw = {
+            box.removeAllViews()
+            val list = repos
+            when {
+                err != null -> box.addView(note("Не удалось загрузить: $err", Theme.RED))
+                list == null -> box.addView(note("Загружаю репозитории…"))
+                list.isEmpty() -> box.addView(note("Нет доступных репозиториев. Дайте приложению Qwen доступ к нужным репозиториям кнопкой ниже."))
+                else -> {
+                    val q = search.text.toString().trim().lowercase()
+                    val have = envs.orEmpty().associateBy { it.repo.lowercase() }
+                    for ((acc, r) in list.filter { q.isEmpty() || it.second.fullName.lowercase().contains(q) }) {
+                        val existing = have[r.fullName.lowercase()]
+                        val row = LinearLayout(this).apply {
+                            gravity = Gravity.CENTER_VERTICAL
+                            background = Md.rippleRect(null)
+                            setPadding(dp(12), dp(11), dp(12), dp(11))
+                        }
+                        row.addView(ImageView(this).apply { setImageResource(R.drawable.ic_repo); setColorFilter(if (existing != null) Theme.GREEN else Theme.MUTED) }, lp(dp(20), dp(20)))
+                        val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                        tb.addView(TextView(this).apply { text = r.fullName; setTextColor(Theme.TEXT); textSize = 14.5f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
+                        val parts = ArrayList<String>()
+                        when {
+                            busy == r.id -> parts.add("Добавляю…")
+                            existing != null -> parts.add("Уже добавлен")
+                        }
+                        parts.add(if (r.isPrivate) "приватный" else "публичный")
+                        if (r.language.isNotEmpty()) parts.add(r.language)
+                        isoAgo(r.pushed).let { if (it.isNotEmpty()) parts.add(it + " назад") }
+                        tb.addView(TextView(this).apply {
+                            text = parts.joinToString(" · ")
+                            setTextColor(if (existing != null || busy == r.id) Theme.ACCENT else Theme.MUTED)
+                            textSize = 12f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END
+                        })
+                        if (r.description.isNotEmpty()) tb.addView(TextView(this).apply { text = r.description; setTextColor(Theme.MUTED); textSize = 12f; maxLines = 2; ellipsize = TextUtils.TruncateAt.END })
+                        row.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+                        row.setOnClickListener {
+                            if (busy != 0L) return@setOnClickListener
+                            if (existing != null) { dlg.dismiss(); onAdded(existing); return@setOnClickListener }
+                            busy = r.id; draw()
+                            pool.execute {
+                                try {
+                                    val env = api.createEnvironment(r, acc.installationId)
+                                    ui.post { busy = 0; dlg.dismiss(); toast("Репозиторий ${r.fullName} добавлен"); onAdded(env) }
+                                } catch (e: Exception) {
+                                    ui.post { busy = 0; draw(); handleError(e) }
+                                }
+                            }
+                        }
+                        box.addView(row, lp(-1, -2))
+                    }
+                }
+            }
+            box.addView(outlineButton("Подключить другой аккаунт или дать доступ к репозиториям") { connectGithub { load() } },
+                lp(-1, -2).apply { setMargins(dp(6), dp(14), dp(6), 0) })
+        }
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) { draw() }
+        })
+        dlg.show()
+        if (envs == null) loadEnvs(false) { if (dlg.isShowing) draw() }
+        load()
+    }
+
+    /** GitHub App installation flow inside a WebView; the redirect back to coder.qwen.ai is validated through the API. */
+    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+    private fun connectGithub(done: () -> Unit) {
+        pool.execute {
+            val url = try { api.githubInstallUrl() } catch (e: Exception) { ui.post { handleError(e) }; return@execute }
+            ui.post {
+                if (url.isEmpty()) { toast("Сервер не вернул ссылку GitHub"); return@post }
+                val (dlg, root, sub) = fullDialog("Подключение GitHub")
+                sub.text = "Войдите в GitHub и выберите репозитории"
+                sub.visibility = View.VISIBLE
+                var handled = false
+                val web = android.webkit.WebView(this).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(v: android.webkit.WebView, r: android.webkit.WebResourceRequest): Boolean = check(r.url)
+
+                        override fun onPageStarted(v: android.webkit.WebView, u: String, f: android.graphics.Bitmap?) {
+                            if (check(Uri.parse(u))) v.stopLoading()
+                        }
+
+                        fun check(u: Uri): Boolean {
+                            if (u.host != "coder.qwen.ai") return false
+                            if (handled) return true
+                            handled = true
+                            val code = u.getQueryParameter("code")
+                            val inst = u.getQueryParameter("installation_id")
+                            if (code == null || inst == null) {
+                                dlg.dismiss(); done(); return true
+                            }
+                            sub.text = "Сохраняю подключение…"
+                            pool.execute {
+                                try {
+                                    api.githubValidate(code, inst, u.getQueryParameter("setup_action").orEmpty(), u.getQueryParameter("state").orEmpty())
+                                    ui.post { dlg.dismiss(); toast("GitHub подключён"); done() }
+                                } catch (e: Exception) {
+                                    ui.post { dlg.dismiss(); handleError(e) }
+                                }
+                            }
+                            return true
+                        }
+                    }
+                    loadUrl(url)
+                }
+                root.addView(web, lp(-1, 0, 1f))
+                dlg.setOnDismissListener { web.destroy() }
+                dlg.show()
+            }
+        }
+    }
 
     private fun openModelPicker() {
         sheet("Модель") { box, dlg ->
