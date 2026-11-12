@@ -27,8 +27,14 @@ class WebLoginActivity : Activity() {
                 finish()
                 return
             }
+            hideGoogle()
             ui.postDelayed(this, 1000)
         }
+    }
+
+    /** Google blocks sign-in inside WebView, so its buttons are hidden: GitHub, Apple and e-mail stay. */
+    private fun hideGoogle() {
+        web.evaluateJavascript(HIDE_JS, null)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,10 +50,32 @@ class WebLoginActivity : Activity() {
             userAgentString = Api.UA
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
-        web.webViewClient = WebViewClient()
+        web.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) = hideGoogle()
+
+            override fun shouldOverrideUrlLoading(view: WebView, r: android.webkit.WebResourceRequest): Boolean {
+                val h = r.url.host.orEmpty()
+                if (h == "accounts.google.com" || h.endsWith(".google.com") && r.url.path.orEmpty().contains("oauth")) {
+                    android.widget.Toast.makeText(this@WebLoginActivity, "Вход через Google здесь недоступен — используйте GitHub или Apple", android.widget.Toast.LENGTH_LONG).show()
+                    return true
+                }
+                return false
+            }
+        }
         setContentView(web)
         web.loadUrl("https://coder.qwen.ai/auth")
         ui.postDelayed(check, 1500)
+    }
+
+    companion object {
+        private const val HIDE_JS = """(function(){
+if(!window.__qcnStyle){var st=document.createElement('style');st.textContent='iframe[src*="accounts.google.com"],#credential_picker_container,#credential_picker_iframe,.g_id_signin,#g_id_onload{display:none!important}';(document.head||document.documentElement).appendChild(st);window.__qcnStyle=1;}
+function h(){var els=document.querySelectorAll('button,a,[role=button],[class*=btn],[class*=Btn],[class*=button],[class*=Button],[class*=google],[class*=Google]');
+for(var i=0;i<els.length;i++){var e=els[i];var t=(e.innerText||e.getAttribute('aria-label')||e.title||'').trim();
+var cls=(typeof e.className==='string'?e.className:'')+' '+(e.id||'');
+if((t.length>0&&t.length<60&&/google/i.test(t))||(/google/i.test(cls)&&t.length<60)){e.style.setProperty('display','none','important');}}}
+h();if(!window.__qcnObs){window.__qcnObs=new MutationObserver(h);window.__qcnObs.observe(document.documentElement,{childList:true,subtree:true});}
+})()"""
     }
 
     override fun onDestroy() {
