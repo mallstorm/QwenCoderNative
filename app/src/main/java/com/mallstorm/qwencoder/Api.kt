@@ -74,6 +74,7 @@ class Api(ctx: Context) {
         const val CODER = "https://coder.qwen.ai"
         const val AUTH = "https://auth.qwen.ai"
         const val VERSION = "0.0.34"
+        const val MAX_ACCOUNTS = 20
         const val GH_REDIRECT = "https://coder.qwen.ai/setting/caenvironment/new"
         const val UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     }
@@ -81,11 +82,115 @@ class Api(ctx: Context) {
     private val prefs = ctx.getSharedPreferences("qwen_auth", Context.MODE_PRIVATE)
     private val jar = HashMap<String, String>()
 
-    @Volatile var accessToken: String? = prefs.getString("access", null)
-    @Volatile var refreshToken: String? = prefs.getString("refresh", null)
-    @Volatile var userName: String = prefs.getString("name", "") ?: ""
-    @Volatile var userEmail: String = prefs.getString("email", "") ?: ""
+    @Volatile var accessToken: String? = null
+    @Volatile var refreshToken: String? = null
+    @Volatile var userName: String = ""
+    @Volatile var userEmail: String = ""
     @Volatile var sseConn: HttpURLConnection? = null
+
+    // ---------- accounts (up to MAX_ACCOUNTS Qwen accounts) ----------
+
+    data class Account(val key: String, val name: String, val email: String)
+
+    private var activeKey: String = ""
+    private var prevKey: String? = null
+
+    init {
+        // migrate the single-account storage of older versions
+        if (!prefs.contains("accounts") && (prefs.contains("refresh") || prefs.contains("access"))) {
+            val a = prefs.getString("access", null)
+            val r = prefs.getString("refresh", null)
+            val key = keyOf(r ?: a) ?: UUID.randomUUID().toString()
+            val o = JSONObject().put("key", key).put("access", a).put("refresh", r)
+                .put("name", prefs.getString("name", "")).put("email", prefs.getString("email", ""))
+            prefs.edit().putString("accounts", JSONArray().put(o).toString()).putString("active", key)
+                .remove("access").remove("refresh").remove("name").remove("email").apply()
+        }
+        activeKey = prefs.getString("active", "") ?: ""
+        loadActive()
+    }
+
+    private fun keyOf(tok: String?): String? = tok?.let { TokenParser.payload(it)?.optString("id")?.ifEmpty { null } }
+
+    private fun store(): JSONArray = try { JSONArray(prefs.getString("accounts", "[]")) } catch (_: Exception) { JSONArray() }
+
+    private fun find(arr: JSONArray, key: String): Int {
+        for (i in 0 until arr.length()) if (arr.optJSONObject(i)?.optString("key") == key) return i
+        return -1
+    }
+
+    private fun str(o: JSONObject, k: String): String? = if (o.isNull(k)) null else o.optString(k).ifEmpty { null }
+
+    private fun loadActive() {
+        val arr = store()
+        val i = find(arr, activeKey)
+        val o = if (i >= 0) arr.getJSONObject(i) else null
+        accessToken = o?.let { str(it, "access") }
+        refreshToken = o?.let { str(it, "refresh") }
+        userName = o?.let { str(it, "name") }.orEmpty()
+        userEmail = o?.let { str(it, "email") }.orEmpty()
+        synchronized(jar) { jar.clear() }
+    }
+
+    @Synchronized
+    private fun persist() {
+        if (activeKey.isEmpty()) return
+        val arr = store()
+        val o = JSONObject().put("key", activeKey).put("access", accessToken).put("refresh", refreshToken)
+            .put("name", userName).put("email", userEmail)
+        val i = find(arr, activeKey)
+        if (i >= 0) arr.put(i, o) else arr.put(o)
+        prefs.edit().putString("accounts", arr.toString()).putString("active", activeKey).apply()
+    }
+
+    fun accounts(): List<Account> {
+        val arr = store()
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { Account(it.optString("key"), str(it, "name").orEmpty(), str(it, "email").orEmpty()) }
+    }
+
+    val activeAccount: String get() = activeKey
+
+    @Synchronized
+    fun switchTo(key: String) {
+        if (find(store(), key) < 0) return
+        cancelStream()
+        activeKey = key
+        prefs.edit().putString("active", key).apply()
+        loadActive()
+    }
+
+    /** Starts signing in another account; the current one stays saved. */
+    @Synchronized
+    fun beginAdd() {
+        prevKey = activeKey.ifEmpty { null }
+        activeKey = ""
+        accessToken = null
+        refreshToken = null
+        userName = ""
+        userEmail = ""
+        synchronized(jar) { jar.clear() }
+    }
+
+    /** Saves the freshly signed-in account (replaces it if it was already in the list). */
+    @Synchronized
+    fun finishAdd() {
+        val key = keyOf(refreshToken ?: accessToken) ?: UUID.randomUUID().toString()
+        val arr = store()
+        if (find(arr, key) < 0 && arr.length() >= MAX_ACCOUNTS) {
+            cancelAdd()
+            throw ApiError("limit", "Можно подключить не больше $MAX_ACCOUNTS аккаунтов")
+        }
+        activeKey = key
+        prevKey = null
+        persist()
+    }
+
+    @Synchronized
+    fun cancelAdd() {
+        activeKey = prevKey ?: prefs.getString("active", "").orEmpty()
+        prevKey = null
+        loadActive()
+    }
 
     val loggedIn: Boolean get() = !refreshToken.isNullOrEmpty() || !accessToken.isNullOrEmpty()
 
@@ -93,17 +198,18 @@ class Api(ctx: Context) {
     fun setTokens(access: String?, refresh: String?) {
         if (access != null) accessToken = access
         if (refresh != null) refreshToken = refresh
-        prefs.edit().putString("access", accessToken).putString("refresh", refreshToken).apply()
+        persist()
     }
 
+    /** Removes the active account; switches to the next saved one if there is any. */
     @Synchronized
     fun logout() {
-        accessToken = null
-        refreshToken = null
-        userName = ""
-        userEmail = ""
-        jar.clear()
-        prefs.edit().clear().apply()
+        val arr = store()
+        val i = find(arr, activeKey)
+        if (i >= 0) arr.remove(i)
+        activeKey = if (arr.length() > 0) arr.getJSONObject(0).optString("key") else ""
+        prefs.edit().putString("accounts", arr.toString()).putString("active", activeKey).apply()
+        loadActive()
     }
 
     // ---------- low level ----------
@@ -198,6 +304,11 @@ class Api(ctx: Context) {
 
     @Synchronized
     fun refresh() {
+        if (activeKey.isNotEmpty()) {
+            val arr = store()
+            val i = find(arr, activeKey)
+            if (i >= 0) str(arr.getJSONObject(i), "refresh")?.let { refreshToken = it }
+        }
         val rt = refreshToken
         if (rt.isNullOrEmpty()) throw ApiError("auth", "Нет refresh-токена. Войдите заново.")
         val r = exec("GET", "$AUTH/api/v2/auths/refresh", null, null, "refresh_token=$rt")
@@ -212,7 +323,7 @@ class Api(ctx: Context) {
         if (name.isNotEmpty() || email.isNotEmpty()) {
             userName = name
             userEmail = email
-            prefs.edit().putString("name", name).putString("email", email).apply()
+            persist()
         }
     }
 
@@ -248,7 +359,7 @@ class Api(ctx: Context) {
         val d = call("GET", "$AUTH/api/v2/auths/").optJSONObject("data") ?: return
         userName = d.optString("name")
         userEmail = d.optString("email")
-        prefs.edit().putString("name", userName).putString("email", userEmail).apply()
+        persist()
     }
 
     fun environments(): List<Env> {

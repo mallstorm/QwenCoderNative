@@ -102,6 +102,8 @@ class MainActivity : Activity() {
     private var pinnedTasks: List<TaskItem> = emptyList()
     private var sandboxFiles: LinkedHashMap<String, ByteArray>? = null
     private var fetchWaiting = false
+    private var adding = false
+    private lateinit var cancelAddBtn: TextView
     private var previewWaiting = false
 
     private var statusAnim: ObjectAnimator? = null
@@ -305,10 +307,24 @@ class MainActivity : Activity() {
             setPadding(0, dp(10), 0, dp(10))
         }
         box.addView(loginStatus, lp(-1, -2))
-        box.addView(gradientButton("Войти") { doLogin(tokenInput.text.toString()) }, lp(-1, -2))
-        box.addView(outlineButton("Войти через встроенный браузер (email)") {
+        box.addView(gradientButton("Войти по токену") { doLogin(tokenInput.text.toString()) }, lp(-1, -2))
+        box.addView(outlineButton("Войти в окне Qwen (GitHub или почта)") {
             startActivityForResult(Intent(this, WebLoginActivity::class.java), 3001)
         }, lp(-1, -2).apply { topMargin = dp(10) })
+        box.addView(TextView(this).apply {
+            text = "Вход через Google внутри приложения Google блокирует — для такого аккаунта используйте токен или привяжите к нему GitHub/пароль на сайте Qwen."
+            setTextColor(Theme.MUTED)
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setPadding(dp(6), dp(8), dp(6), 0)
+        }, lp(-1, -2))
+        cancelAddBtn = outlineButton("Отмена — вернуться к текущему аккаунту") {
+            adding = false
+            api.cancelAdd()
+            cancelAddBtn.visibility = View.GONE
+            showMain()
+        }.apply { visibility = View.GONE }
+        box.addView(cancelAddBtn, lp(-1, -2).apply { topMargin = dp(10) })
         box.addView(TextView(this).apply {
             text = "Токен хранится только на этом телефоне."
             setTextColor(Theme.MUTED)
@@ -547,11 +563,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(14))
             background = Md.rippleRect(null)
-            setOnClickListener {
-                AlertDialog.Builder(this@MainActivity).setTitle("Выйти из аккаунта?")
-                    .setPositiveButton("Выйти") { _, _ -> logout() }
-                    .setNegativeButton("Отмена", null).show()
-            }
+            setOnClickListener { openAccounts() }
         }
         avatarView = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -578,7 +590,7 @@ class MainActivity : Activity() {
         accText.addView(emailView)
         acc.addView(accText, lp(0, -2, 1f).apply { leftMargin = dp(12) })
         acc.addView(TextView(this).apply {
-            text = "выйти"
+            text = "сменить"
             setTextColor(Theme.MUTED)
             textSize = 12f
         })
@@ -880,6 +892,11 @@ class MainActivity : Activity() {
     private fun logout() {
         api.cancelStream()
         api.logout()
+        if (api.loggedIn) {
+            toast("Аккаунт: " + api.userName.ifEmpty { api.userEmail })
+            recreate()
+            return
+        }
         curId = null
         thread = emptyList()
         tasks = emptyList()
@@ -891,9 +908,10 @@ class MainActivity : Activity() {
 
     private fun handleError(e: Exception) {
         if (e is ApiError && e.code == "auth") {
-            toast("Сессия истекла: войдите заново")
+            val who = api.userName.ifEmpty { api.userEmail }
             api.logout()
-            showLogin()
+            toast("Сессия $who истекла: войдите в этот аккаунт заново")
+            if (api.loggedIn) recreate() else showLogin()
         } else {
             toast(e.message ?: "Ошибка сети")
         }
@@ -906,20 +924,91 @@ class MainActivity : Activity() {
             return
         }
         loginStatus.text = "Проверяю вход…"
+        val wasAdding = adding
         pool.execute {
             try {
+                api.beginAdd()
                 api.setTokens(a, r)
                 api.ensureAccess(!r.isNullOrEmpty())
                 api.me()
+                api.finishAdd()
                 ui.post {
                     loginStatus.text = ""
                     tokenInput.setText("")
-                    showMain()
+                    adding = false
+                    cancelAddBtn.visibility = View.GONE
+                    if (wasAdding) {
+                        toast("Аккаунт добавлен: " + api.userName.ifEmpty { api.userEmail })
+                        recreate()
+                    } else showMain()
                 }
             } catch (e: Exception) {
-                api.logout()
+                if (!(e is ApiError && e.code == "limit")) api.cancelAdd()
                 ui.post { loginStatus.text = "Не удалось войти: " + (e.message ?: "ошибка") }
             }
+        }
+    }
+
+    // ---------- accounts ----------
+
+    private fun openAccounts() {
+        sheet("Аккаунты Qwen") { box, dlg ->
+            val list = api.accounts()
+            for (a in list) {
+                val on = a.key == api.activeAccount
+                val row = LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = Md.rippleRect(Md.round(if (on) Theme.SURFACE2 else Theme.SURFACE, 16, this@MainActivity, if (on) Theme.ACCENT else Theme.STROKE))
+                    setPadding(dp(14), dp(11), dp(14), dp(11))
+                    setOnClickListener {
+                        dlg.dismiss()
+                        if (!on) {
+                            api.switchTo(a.key)
+                            toast("Аккаунт: " + a.name.ifEmpty { a.email })
+                            recreate()
+                        }
+                    }
+                }
+                val n = a.name.ifEmpty { a.email }.ifEmpty { "Аккаунт Qwen" }
+                row.addView(TextView(this).apply {
+                    text = n.firstOrNull()?.uppercase() ?: "Q"
+                    setTextColor(Color.WHITE); textSize = 15f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+                    background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+                }, lp(dp(36), dp(36)))
+                val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                tb.addView(TextView(this).apply { text = n; setTextColor(Theme.TEXT); textSize = 15f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
+                if (a.email.isNotEmpty() && a.email != n) tb.addView(TextView(this).apply { text = a.email; setTextColor(Theme.MUTED); textSize = 12.5f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
+                row.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+                if (on) row.addView(ImageView(this).apply {
+                    setImageResource(R.drawable.ic_check); setColorFilter(Color.WHITE)
+                    background = Md.circleGradient(Theme.ACCENT, Theme.ACCENT2)
+                    setPadding(dp(5), dp(5), dp(5), dp(5))
+                }, lp(dp(24), dp(24)))
+                box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            val full = list.size >= Api.MAX_ACCOUNTS
+            box.addView(gradientButton(if (full) "Достигнут предел: ${Api.MAX_ACCOUNTS} аккаунтов" else "+  Добавить аккаунт  (${list.size}/${Api.MAX_ACCOUNTS})") {
+                if (full) return@gradientButton
+                dlg.dismiss()
+                adding = true
+                cancelAddBtn.visibility = View.VISIBLE
+                loginStatus.text = ""
+                showLogin()
+            }, lp(-1, -2).apply { topMargin = dp(4) })
+            box.addView(TextView(this).apply {
+                text = "Выйти из текущего аккаунта"
+                setTextColor(Theme.RED)
+                textSize = 14.5f
+                gravity = Gravity.CENTER
+                setPadding(0, dp(16), 0, dp(4))
+                setOnClickListener {
+                    dlg.dismiss()
+                    AlertDialog.Builder(this@MainActivity).setTitle("Выйти из аккаунта?")
+                        .setMessage(api.userName.ifEmpty { api.userEmail })
+                        .setPositiveButton("Выйти") { _, _ -> logout() }
+                        .setNegativeButton("Отмена", null).show()
+                }
+            }, lp(-1, -2))
         }
     }
 
@@ -2327,6 +2416,7 @@ class MainActivity : Activity() {
                 loadUsage()
                 if (id != null) fetchDetail(id)
             }
+            item("Аккаунты", api.userName.ifEmpty { api.userEmail }) { openAccounts() }
             item("Выйти", "", Theme.RED) { logout() }
         }
     }
