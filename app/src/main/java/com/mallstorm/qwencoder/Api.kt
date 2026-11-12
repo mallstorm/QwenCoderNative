@@ -74,7 +74,6 @@ class Api(ctx: Context) {
         const val CODER = "https://coder.qwen.ai"
         const val AUTH = "https://auth.qwen.ai"
         const val VERSION = "0.0.34"
-        const val MAX_ACCOUNTS = 20
         const val GH_REDIRECT = "https://coder.qwen.ai/setting/caenvironment/new"
         const val UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     }
@@ -88,7 +87,7 @@ class Api(ctx: Context) {
     @Volatile var userEmail: String = ""
     @Volatile var sseConn: HttpURLConnection? = null
 
-    // ---------- accounts (up to MAX_ACCOUNTS Qwen accounts) ----------
+    // ---------- accounts (any number of Qwen accounts) ----------
 
     data class Account(val key: String, val name: String, val email: String)
 
@@ -175,11 +174,6 @@ class Api(ctx: Context) {
     @Synchronized
     fun finishAdd() {
         val key = keyOf(refreshToken ?: accessToken) ?: UUID.randomUUID().toString()
-        val arr = store()
-        if (find(arr, key) < 0 && arr.length() >= MAX_ACCOUNTS) {
-            cancelAdd()
-            throw ApiError("limit", "Можно подключить не больше $MAX_ACCOUNTS аккаунтов")
-        }
         activeKey = key
         prevKey = null
         persist()

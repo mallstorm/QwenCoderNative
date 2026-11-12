@@ -589,11 +589,6 @@ class MainActivity : Activity() {
         accText.addView(nameView)
         accText.addView(emailView)
         acc.addView(accText, lp(0, -2, 1f).apply { leftMargin = dp(12) })
-        acc.addView(TextView(this).apply {
-            text = "сменить"
-            setTextColor(Theme.MUTED)
-            textSize = 12f
-        })
         side.addView(acc, lp(-1, -2))
         dl.addView(side, DrawerLayout.LayoutParams(dp(310), -1).apply { gravity = Gravity.START })
         codePanel = CodePanel(this, { api.changesFromSteps(it) }, { dl.closeDrawer(Gravity.END) }, { openUrl(it) }, { fetchSandbox() }, { startPreviewServer() }, { saveSandbox() })
@@ -943,7 +938,7 @@ class MainActivity : Activity() {
                     } else showMain()
                 }
             } catch (e: Exception) {
-                if (!(e is ApiError && e.code == "limit")) api.cancelAdd()
+                api.cancelAdd()
                 ui.post { loginStatus.text = "Не удалось войти: " + (e.message ?: "ошибка") }
             }
         }
@@ -986,9 +981,7 @@ class MainActivity : Activity() {
                 }, lp(dp(24), dp(24)))
                 box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
             }
-            val full = list.size >= Api.MAX_ACCOUNTS
-            box.addView(gradientButton(if (full) "Достигнут предел: ${Api.MAX_ACCOUNTS} аккаунтов" else "+  Добавить аккаунт  (${list.size}/${Api.MAX_ACCOUNTS})") {
-                if (full) return@gradientButton
+            box.addView(gradientButton("+  Добавить аккаунт") {
                 dlg.dismiss()
                 adding = true
                 cancelAddBtn.visibility = View.VISIBLE
