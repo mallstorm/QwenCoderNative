@@ -103,7 +103,7 @@ class MainActivity : Activity() {
     private lateinit var runChip: TextView
     private lateinit var usageView: TextView
     private var thinking = false
-    private var branch = HashMap<String, String>()
+    private var branchSel = HashMap<String, String>()
     private var detail: JSONObject? = null
     private var editing = false
     private var editParent: String? = null
@@ -1926,7 +1926,7 @@ class MainActivity : Activity() {
         streaming = false
         running = false
         cancelled = false
-        branch.clear()
+        branchSel.clear()
         detail = null
         prRepo = ""; prBase = ""; prHead = ""
         cancelEdit(false)
@@ -2042,7 +2042,7 @@ class MainActivity : Activity() {
 
     private fun applyDetail(d: JSONObject) {
         detail = d
-        thread = trimForPending(withWork(api.parseThread(d, branch)))
+        thread = trimForPending(withWork(api.parseThread(d, branchSel)))
         d.optJSONObject("meta")?.let { m ->
             prHead = m.optString("branch_title").let { if (it == "null") "" else it }
         }
@@ -2290,8 +2290,8 @@ class MainActivity : Activity() {
         val d = detail ?: return
         if (streaming) { toast("Дождитесь окончания ответа"); return }
         val target = m.sibs.getOrNull(to) ?: return
-        branch[m.parent] = target
-        thread = withWork(api.parseThread(d, branch))
+        branchSel[m.parent] = target
+        thread = withWork(api.parseThread(d, branchSel))
         leafId = thread.lastOrNull()?.id
         rebuildDisplay()
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
@@ -2319,7 +2319,7 @@ class MainActivity : Activity() {
     private fun regenerate(m: ChatMsg) {
         if (agentBusy()) return
         val id = curId ?: return
-        branch.clear()
+        branchSel.clear()
         startStream(id, m.text, m.parent.ifEmpty { null })
     }
 
@@ -2600,7 +2600,7 @@ class MainActivity : Activity() {
             if (editing) {
                 val p = editParent
                 cancelEdit(false)
-                branch.clear()
+                branchSel.clear()
                 startStream(id, t, p)
             } else {
                 startStream(id, t)
@@ -2642,7 +2642,7 @@ class MainActivity : Activity() {
         streaming = true
         cancelled = false
         live = Live()
-        branch.clear()
+        branchSel.clear()
         if (parent != leafId) {
             val i = if (parent == null) -1 else thread.indexOfFirst { it.id == parent }
             trimOld = thread.getOrNull(i + 1)?.id
