@@ -14,6 +14,8 @@ import android.os.IBinder
 class WatchService : Service() {
     @Volatile private var alive = false
     private var thread: Thread? = null
+    private var socket: NotifySocket? = null
+    private val lock = Object()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,6 +45,7 @@ class WatchService : Service() {
 
     private fun loop(nm: NotificationManager) {
         val api = Api(this)
+        socket = NotifySocket(api) { synchronized(lock) { lock.notifyAll() } }.also { it.start() }
         var known = HashMap<String, TaskItem>()
         var empty = 0
         var rounds = 0
@@ -58,12 +61,13 @@ class WatchService : Service() {
             }
             if (empty >= 3 || visible) break
             try {
-                Thread.sleep(20_000)
+                synchronized(lock) { lock.wait(20_000) }
             } catch (_: InterruptedException) {
                 break
             }
         }
         alive = false
+        socket?.stop()
         stopForeground(true)
         stopSelf()
     }
@@ -86,6 +90,7 @@ class WatchService : Service() {
 
     override fun onDestroy() {
         alive = false
+        socket?.stop()
         thread?.interrupt()
         super.onDestroy()
     }

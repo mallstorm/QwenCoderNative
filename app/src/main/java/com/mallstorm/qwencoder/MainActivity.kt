@@ -56,6 +56,10 @@ class MainActivity : Activity() {
         var error: String? = null
     }
 
+    companion object {
+        @Volatile var lastActive = 0L
+    }
+
     private data class ModelInfo(val id: String, val title: String, val hint: String)
 
     private val models = listOf(
@@ -99,6 +103,23 @@ class MainActivity : Activity() {
     private lateinit var runChip: TextView
     private lateinit var usageView: TextView
     private var thinking = false
+    private var branch = HashMap<String, String>()
+    private var detail: JSONObject? = null
+    private var editing = false
+    private var editParent: String? = null
+    private var trimTo: String? = null
+    private var trimOld: String? = null
+    private lateinit var editBar: TextView
+    private var prRepo = ""
+    private var prBase = ""
+    private var prHead = ""
+    private var notify: NotifySocket? = null
+    private var sharedText: String? = null
+    private var lockOn = false
+    private var locked = false
+    private var authPending = false
+    private lateinit var lockView: View
+    private val switchAsked = HashSet<String>()
     private var onlyRunning = false
     private var query = ""
     private var pinnedTasks: List<TaskItem> = emptyList()
@@ -159,13 +180,21 @@ class MainActivity : Activity() {
         window.navigationBarColor = Theme.BG
         if (Theme.light) window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        lockOn = prefs.getBoolean("applock", false)
+        if (lockOn) window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
 
         val root = FrameLayout(this).apply { setBackgroundColor(Theme.BG) }
         drawer = buildMain()
         root.addView(drawer, FrameLayout.LayoutParams(-1, -1))
         loginView = buildLogin()
         root.addView(loginView, FrameLayout.LayoutParams(-1, -1))
+        lockView = buildLock()
+        root.addView(lockView, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
+        if (lockOn && (lastActive == 0L || android.os.SystemClock.elapsedRealtime() - lastActive > 30_000)) {
+            locked = true
+            lockView.visibility = View.VISIBLE
+        }
 
         if (api.loggedIn) showMain() else showLogin()
         handleIntent(intent)
@@ -173,6 +202,56 @@ class MainActivity : Activity() {
             intent.removeExtra("open_settings")
             ui.post { openSettings() }
         }
+    }
+
+    // ---------- app lock ----------
+
+    private fun buildLock(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        setBackgroundColor(Theme.BG)
+        isClickable = true
+        visibility = View.GONE
+        addView(Md.logoView(this@MainActivity, 64), lp(dp(64), dp(64)))
+        addView(TextView(this@MainActivity).apply {
+            text = "Qwen Coder заблокирован"
+            setTextColor(Theme.TEXT); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(16), 0, 0)
+        })
+        addView(gradientButton("Разблокировать") { askUnlock() }, lp(dp(220), -2).apply { topMargin = dp(24) })
+    }
+
+    private fun lockNow() {
+        if (!lockOn) return
+        locked = true
+        lockView.visibility = View.VISIBLE
+        askUnlock()
+    }
+
+    private fun askUnlock() {
+        if (authPending) return
+        val km = getSystemService(android.app.KeyguardManager::class.java)
+        val i = if (km != null && km.isDeviceSecure) km.createConfirmDeviceCredentialIntent("Qwen Coder", "Подтвердите, что это вы") else null
+        if (i == null) {
+            prefs.edit().putBoolean("applock", false).apply()
+            lockOn = false
+            unlock()
+            toast("На устройстве нет блокировки экрана — защита приложения выключена")
+            return
+        }
+        authPending = true
+        try {
+            startActivityForResult(i, 4001)
+        } catch (_: Exception) {
+            authPending = false
+            unlock()
+        }
+    }
+
+    private fun unlock() {
+        locked = false
+        lockView.visibility = View.GONE
+        lastActive = android.os.SystemClock.elapsedRealtime()
     }
 
     // ---------- UI helpers ----------
@@ -467,6 +546,12 @@ class MainActivity : Activity() {
         }
         composer.addView(input, lp(0, -2, 1f))
         micBtn = icon(R.drawable.ic_mic, "Голосовой ввод", Theme.MUTED) { toggleDictation() }
+        composer.addView(TextView(this).apply {
+            text = "/"
+            setTextColor(Theme.MUTED); textSize = 22f; gravity = Gravity.CENTER
+            contentDescription = "Шаблоны"
+            setOnClickListener { openTemplates() }
+        }, lp(dp(34), dp(40)))
         composer.addView(micBtn, lp(dp(40), dp(40)))
         sendBtn = ImageButton(this).apply {
             setImageResource(R.drawable.ic_send)
@@ -478,6 +563,15 @@ class MainActivity : Activity() {
             setOnClickListener { send() }
         }
         composer.addView(sendBtn, lp(dp(40), dp(40)).apply { leftMargin = dp(2) })
+        editBar = TextView(this).apply {
+            text = "✎  Редактирование сообщения — будет создана новая ветка   ✕"
+            setTextColor(Theme.ACCENT); textSize = 12.5f
+            background = Md.round(Theme.SURFACE2, 12, this@MainActivity)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            visibility = View.GONE
+            setOnClickListener { cancelEdit(true) }
+        }
+        wrap.addView(editBar, lp(-1, -2).apply { bottomMargin = dp(6) })
         wrap.addView(composer, lp(-1, -2))
         content.addView(wrap, lp(-1, -2))
         dl.addView(content, DrawerLayout.LayoutParams(-1, -1))
@@ -595,7 +689,7 @@ class MainActivity : Activity() {
         acc.addView(accText, lp(0, -2, 1f).apply { leftMargin = dp(12) })
         side.addView(acc, lp(-1, -2))
         dl.addView(side, DrawerLayout.LayoutParams(dp(310), -1).apply { gravity = Gravity.START })
-        codePanel = CodePanel(this, { api.changesFromSteps(it) }, { dl.closeDrawer(Gravity.END) }, { openUrl(it) }, { fetchSandbox() }, { startPreviewServer() }, { saveSandbox() })
+        codePanel = CodePanel(this, { api.changesFromSteps(it) }, { dl.closeDrawer(Gravity.END) }, { openUrl(it) }, { fetchSandbox() }, { startPreviewServer() }, { saveSandbox() }, { path, bytes, share -> fileAction(path, bytes, share) })
         val pw = minOf((resources.displayMetrics.widthPixels * 0.94f).toInt(), dp(520))
         dl.addView(codePanel, DrawerLayout.LayoutParams(pw, -1).apply { gravity = Gravity.END })
         dl.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, Gravity.END)
@@ -627,17 +721,62 @@ class MainActivity : Activity() {
         drawer.openDrawer(Gravity.END)
     }
 
+    private fun usageText(u: Usage?): String {
+        if (u == null || u.remaining < 0) return "кредиты: нет данных"
+        val reset = if (u.resetAt > 0) " · сброс " + SimpleDateFormat("d MMM HH:mm", Locale("ru")).format(java.util.Date(u.resetAt)) else ""
+        return "Осталось ${u.remaining}% · ${u.member.ifEmpty { "free" }}$reset"
+    }
+
+    private fun usageColor(u: Usage?): Int = when {
+        u == null || u.remaining < 0 -> Theme.MUTED
+        u.remaining == 0 -> Theme.RED
+        u.remaining <= 10 -> Theme.AMBER
+        else -> Theme.MUTED
+    }
+
     private fun loadUsage() {
         pool.execute {
             val u = api.usage()
             ui.post {
                 if (u == null || u.remaining < 0) return@post
-                val reset = if (u.resetAt > 0) " · сброс " + java.text.SimpleDateFormat("d MMM HH:mm", Locale("ru")).format(java.util.Date(u.resetAt)) else ""
-                usageView.text = "Осталось ${u.remaining}% · ${u.member.ifEmpty { "free" }}$reset"
-                usageView.setTextColor(if (u.remaining <= 10) Theme.AMBER else Theme.MUTED)
+                usageView.text = usageText(u)
+                usageView.setTextColor(usageColor(u))
                 usageView.visibility = View.VISIBLE
+                if (u.remaining == 0 && switchAsked.add(api.activeAccount)) suggestSwitch()
             }
         }
+    }
+
+    /** Current account is out of credits: offer another saved account that still has some. */
+    private fun suggestSwitch() {
+        val cur = api.activeAccount
+        pool.execute {
+            var best: Pair<Api.Account, Usage>? = null
+            for (a in api.accounts()) {
+                if (a.key == cur) continue
+                val u = api.usageFor(a.key) ?: continue
+                val b = best
+                if (u.remaining > 0 && (b == null || u.remaining > b.second.remaining)) best = Pair(a, u)
+            }
+            val found = best ?: return@execute
+            ui.post {
+                AlertDialog.Builder(this).setTitle("Кредиты закончились")
+                    .setMessage("Переключиться на «${found.first.name.ifEmpty { found.first.email }}»? Там осталось ${found.second.remaining}%.")
+                    .setPositiveButton("Переключить") { _, _ ->
+                        api.switchTo(found.first.key)
+                        recreate()
+                    }
+                    .setNegativeButton("Нет", null).show()
+            }
+        }
+    }
+
+    private fun onPull() {
+        if (!api.loggedIn) return
+        loadTasks()
+        loadUsage()
+        val id = curId
+        if (id != null && (running || streaming)) fetchDetail(id)
     }
 
     private fun restartUi(openSettings: Boolean) {
@@ -729,6 +868,31 @@ class MainActivity : Activity() {
         fc.addView(ends, lp(-1, -2))
         box.addView(fc, lp(-1, -2))
 
+        box.addView(label("БЕЗОПАСНОСТЬ"))
+        val sc = card()
+        val lockRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        val lt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lt.addView(TextView(this).apply { text = "Блокировка приложения"; setTextColor(Theme.TEXT); textSize = 14.5f })
+        lt.addView(TextView(this).apply { text = "Отпечаток пальца, PIN или графический ключ устройства. Токены аккаунтов хранятся на телефоне; в списке недавних экран скрывается."; setTextColor(Theme.MUTED); textSize = 12f })
+        lockRow.addView(lt, lp(0, -2, 1f))
+        lockRow.addView(android.widget.Switch(this).apply {
+            isChecked = lockOn
+            setOnCheckedChangeListener { _, on ->
+                val km = getSystemService(android.app.KeyguardManager::class.java)
+                if (on && (km == null || !km.isDeviceSecure)) {
+                    isChecked = false
+                    toast("Сначала включите блокировку экрана в настройках телефона")
+                } else {
+                    prefs.edit().putBoolean("applock", on).apply()
+                    lockOn = on
+                    if (on) this@MainActivity.window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+                    else this@MainActivity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+            }
+        })
+        sc.addView(lockRow)
+        box.addView(sc, lp(-1, -2))
+
         box.addView(label("QWEN CODER"))
         val qc = card()
         val status = TextView(this).apply { text = "Загрузка настроек…"; setTextColor(Theme.MUTED); textSize = 13f }
@@ -790,10 +954,33 @@ class MainActivity : Activity() {
     }
 
     private fun handleIntent(i: Intent?) {
-        val id = i?.getStringExtra("task_id") ?: return
+        if (i == null) return
+        if (i.action == Intent.ACTION_SEND) {
+            val t = listOfNotNull(i.getStringExtra(Intent.EXTRA_SUBJECT), i.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString())
+                .filter { it.isNotBlank() }.distinct().joinToString("\n\n")
+            i.action = Intent.ACTION_MAIN
+            i.removeExtra(Intent.EXTRA_TEXT)
+            i.removeExtra(Intent.EXTRA_SUBJECT)
+            if (t.isNotBlank()) {
+                sharedText = t.take(30_000)
+                applyShare()
+            }
+        }
+        val id = i.getStringExtra("task_id") ?: return
         i.removeExtra("task_id")
         if (!api.loggedIn) return
         openTask(id, i.getStringExtra("task_title").orEmpty(), i.getStringExtra("task_repo").orEmpty(), i.getStringExtra("task_branch").orEmpty())
+    }
+
+    /** Text shared from another app becomes the prompt of a new task. */
+    private fun applyShare() {
+        val t = sharedText ?: return
+        if (!api.loggedIn) return
+        sharedText = null
+        startNewTask()
+        input.setText(t)
+        input.setSelection(input.text.length)
+        toast("Текст готов — допишите задачу и отправьте")
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -877,6 +1064,7 @@ class MainActivity : Activity() {
         loadTasks()
         loadUsage()
         loadEnvs(false)
+        applyShare()
         if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 2002)
         pool.execute {
             try {
@@ -953,6 +1141,7 @@ class MainActivity : Activity() {
     private fun openAccounts() {
         sheet("Аккаунты Qwen") { box, dlg ->
             val list = api.accounts()
+            val uvs = HashMap<String, TextView>()
             for (a in list) {
                 val on = a.key == api.activeAccount
                 val row = LinearLayout(this).apply {
@@ -977,6 +1166,9 @@ class MainActivity : Activity() {
                 val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                 tb.addView(TextView(this).apply { text = n; setTextColor(Theme.TEXT); textSize = 15f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
                 if (a.email.isNotEmpty() && a.email != n) tb.addView(TextView(this).apply { text = a.email; setTextColor(Theme.MUTED); textSize = 12.5f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
+                val uv = TextView(this).apply { text = "кредиты: загрузка…"; setTextColor(Theme.MUTED); textSize = 12f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
+                tb.addView(uv)
+                uvs[a.key] = uv
                 row.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
                 if (on) row.addView(ImageView(this).apply {
                     setImageResource(R.drawable.ic_check); setColorFilter(Color.WHITE)
@@ -984,6 +1176,12 @@ class MainActivity : Activity() {
                     setPadding(dp(5), dp(5), dp(5), dp(5))
                 }, lp(dp(24), dp(24)))
                 box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            for (a in list) pool.execute {
+                val u = api.usageFor(a.key)
+                ui.post {
+                    if (dlg.isShowing) uvs[a.key]?.let { it.text = usageText(u); it.setTextColor(usageColor(u)) }
+                }
             }
             box.addView(gradientButton("+  Добавить аккаунт") {
                 dlg.dismiss()
@@ -1728,6 +1926,10 @@ class MainActivity : Activity() {
         streaming = false
         running = false
         cancelled = false
+        branch.clear()
+        detail = null
+        prRepo = ""; prBase = ""; prHead = ""
+        cancelEdit(false)
         openSteps.clear()
         fetchWaiting = false
         previewWaiting = false
@@ -1827,8 +2029,23 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun trimForPending(l: List<ChatMsg>): List<ChatMsg> {
+        val p = pending
+        val t = trimTo
+        if (p == null || t == null || !streaming) return l
+        val i = if (t.isEmpty()) -1 else l.indexOfFirst { it.id == t }
+        if (t.isNotEmpty() && i < 0) return l
+        val next = l.getOrNull(i + 1)
+        if (next != null && next.role == "user" && next.id != trimOld && next.text.trim() == p.trim()) return l
+        return l.take(i + 1)
+    }
+
     private fun applyDetail(d: JSONObject) {
-        thread = withWork(api.parseThread(d))
+        detail = d
+        thread = trimForPending(withWork(api.parseThread(d, branch)))
+        d.optJSONObject("meta")?.let { m ->
+            prHead = m.optString("branch_title").let { if (it == "null") "" else it }
+        }
         leafId = thread.lastOrNull()?.id
         val tail = thread.lastOrNull()
         if (tail != null && tail.role == "assistant" && tail.done) running = false
@@ -1838,6 +2055,8 @@ class MainActivity : Activity() {
         if (info != null) {
             val repo = info.optString("repository")
             val br = info.optString("selected_branch")
+            prRepo = repo
+            prBase = br
             curRepo = listOf(repo, br).filter { it.isNotEmpty() }.joinToString(" · ")
         }
         updateHeader()
@@ -2030,6 +2249,7 @@ class MainActivity : Activity() {
             return w
         }
         val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
             layoutParams = lp(-1, -2).apply { bottomMargin = dp(16) }
         }
@@ -2042,7 +2262,74 @@ class MainActivity : Activity() {
             setPadding(dp(15), dp(11), dp(15), dp(11))
             maxWidth = (resources.displayMetrics.widthPixels * 0.84).toInt()
         })
+        if (m.id != "pending") {
+            val acts = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(2), 0, 0) }
+            fun act(t: String, enabled: Boolean = true, onClick: () -> Unit) = TextView(this).apply {
+                text = t
+                setTextColor(if (enabled) Theme.MUTED else Theme.STROKE)
+                textSize = 12.5f
+                setPadding(dp(8), dp(6), dp(8), dp(6))
+                if (enabled) setOnClickListener { onClick() }
+            }
+            if (m.sibs.size > 1) {
+                val idx = m.sibs.indexOf(m.id).coerceAtLeast(0)
+                acts.addView(act("‹", idx > 0) { switchBranch(m, idx - 1) })
+                acts.addView(act("${idx + 1}/${m.sibs.size}", false) {})
+                acts.addView(act("›", idx < m.sibs.size - 1) { switchBranch(m, idx + 1) })
+            }
+            acts.addView(act("Изменить") { startEdit(m) })
+            acts.addView(act("Заново") { regenerate(m) })
+            wrap.addView(acts)
+        }
         return wrap
+    }
+
+    // ---------- edit / regenerate / branches ----------
+
+    private fun switchBranch(m: ChatMsg, to: Int) {
+        val d = detail ?: return
+        if (streaming) { toast("Дождитесь окончания ответа"); return }
+        val target = m.sibs.getOrNull(to) ?: return
+        branch[m.parent] = target
+        thread = withWork(api.parseThread(d, branch))
+        leafId = thread.lastOrNull()?.id
+        rebuildDisplay()
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun startEdit(m: ChatMsg) {
+        if (agentBusy()) return
+        editing = true
+        editParent = m.parent.ifEmpty { null }
+        editBar.visibility = View.VISIBLE
+        input.setText(m.text)
+        input.setSelection(input.text.length)
+        input.requestFocus()
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).showSoftInput(input, 0)
+    }
+
+    private fun cancelEdit(clear: Boolean) {
+        if (!editing && clear) return
+        editing = false
+        editParent = null
+        if (::editBar.isInitialized) editBar.visibility = View.GONE
+        if (clear) input.setText("")
+    }
+
+    private fun regenerate(m: ChatMsg) {
+        if (agentBusy()) return
+        val id = curId ?: return
+        branch.clear()
+        startStream(id, m.text, m.parent.ifEmpty { null })
+    }
+
+    // ---------- Pull Request ----------
+
+    private fun prUrl(): String? {
+        val repo = prRepo.removePrefix("https://github.com/").trim('/')
+        if (!repo.contains("/") || prHead.isEmpty()) return null
+        val base = prBase.ifEmpty { "main" }
+        return "https://github.com/$repo/compare/${Uri.encode(base, "/")}...${Uri.encode(prHead, "/")}?expand=1"
     }
 
     private fun assistantView(m: ChatMsg): View {
@@ -2092,13 +2379,29 @@ class MainActivity : Activity() {
             })
         }
         if (m.done && m.text.isNotBlank() && m.id != "live" && m.id != "wait") {
-            col.addView(TextView(this).apply {
+            val ar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+            ar.addView(TextView(this).apply {
                 text = "Копировать ответ"
                 setTextColor(Theme.MUTED)
                 textSize = 12f
                 setPadding(0, dp(6), dp(12), dp(6))
                 setOnClickListener { Md.copy(this@MainActivity, m.text) }
             })
+            val ti = thread.indexOfFirst { it.id == m.id }
+            if (ti > 0 && ti == thread.lastIndex && thread[ti - 1].role == "user" && !Sandbox.isService(thread[ti - 1].text)) {
+                ar.addView(TextView(this).apply {
+                    text = "Ответить заново"
+                    setTextColor(Theme.MUTED)
+                    textSize = 12f
+                    setPadding(0, dp(6), dp(12), dp(6))
+                    setOnClickListener { regenerate(thread[ti - 1]) }
+                })
+            }
+            col.addView(ar)
+            if (ti >= 0 && ti == thread.lastIndex && (m.commit.isNotEmpty() || m.files.isNotEmpty())) {
+                val url = prUrl()
+                if (url != null) col.addView(outlineButton("Создать Pull Request на GitHub") { openUrl(url) }, lp(-2, -2).apply { topMargin = dp(8) })
+            }
         }
         return col
     }
@@ -2289,12 +2592,19 @@ class MainActivity : Activity() {
             toast("Остановлено на телефоне. Задача может продолжить работу на сервере.")
             return
         }
-        val t = input.text.toString().trim()
+        val t = expandSlash(input.text.toString().trim())
         if (t.isEmpty()) return
         val id = curId
         if (id != null) {
             input.setText("")
-            startStream(id, t)
+            if (editing) {
+                val p = editParent
+                cancelEdit(false)
+                branch.clear()
+                startStream(id, t, p)
+            } else {
+                startStream(id, t)
+            }
             return
         }
         val env = selEnv
@@ -2328,17 +2638,25 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startStream(id: String, text: String) {
+    private fun startStream(id: String, text: String, parent: String? = leafId) {
         streaming = true
         cancelled = false
         live = Live()
+        branch.clear()
+        if (parent != leafId) {
+            val i = if (parent == null) -1 else thread.indexOfFirst { it.id == parent }
+            trimOld = thread.getOrNull(i + 1)?.id
+            if (parent == null || i >= 0) thread = thread.take(i + 1)
+            trimTo = parent ?: ""
+        } else {
+            trimTo = null
+        }
         pending = text
         pendingBase = thread.count { it.role == "user" }
         updateSend()
         updateHeader()
         rebuildDisplay()
         startPolling()
-        val parent = leafId
         val mdl = selModel
         val think = thinking
         pool.execute {
@@ -2358,8 +2676,10 @@ class MainActivity : Activity() {
                     updateSend()
                     live?.let { saveWork(it.respId, it.work.toString()) }
                     if (errMsg != null) toast(errMsg)
+                    trimTo = null
                     fetchDetail(id)
                     loadTasks()
+                    loadUsage()
                 }
             }
         }
@@ -2435,6 +2755,161 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- templates (slash commands) ----------
+
+    private val defaultTemplates = listOf(
+        "fix" to "Найди и исправь ошибку. Опиши причину и что именно изменено. Если есть тесты — запусти их.",
+        "review" to "Сделай code review текущих изменений: найди баги, проблемы безопасности и читаемости, предложи конкретные правки.",
+        "tests" to "Напиши тесты для кода проекта, запусти их и исправь то, что падает.",
+        "explain" to "Объясни, как устроен проект: структура, ключевые модули, как его запустить и собрать.",
+        "refactor" to "Проведи рефакторинг: убери дублирование и упрости код, не меняя поведение. Запусти тесты."
+    )
+
+    private fun templates(): MutableList<Pair<String, String>> {
+        val raw = prefs.getString("templates", null) ?: return defaultTemplates.toMutableList()
+        return try {
+            val a = org.json.JSONArray(raw)
+            (0 until a.length()).mapNotNull { a.optJSONObject(it) }.map { Pair(it.optString("name"), it.optString("text")) }.toMutableList()
+        } catch (_: Exception) {
+            defaultTemplates.toMutableList()
+        }
+    }
+
+    private fun saveTemplates(l: List<Pair<String, String>>) {
+        val a = org.json.JSONArray()
+        for ((n, t) in l) a.put(JSONObject().put("name", n).put("text", t))
+        prefs.edit().putString("templates", a.toString()).apply()
+    }
+
+    private fun expandSlash(t: String): String {
+        if (!t.startsWith("/")) return t
+        val name = t.drop(1).takeWhile { !it.isWhitespace() }
+        val rest = t.drop(1 + name.length).trim()
+        val tpl = templates().firstOrNull { it.first.equals(name, true) } ?: return t
+        return if (rest.isEmpty()) tpl.second else tpl.second + "\n\n" + rest
+    }
+
+    private fun openTemplates() {
+        sheet("Шаблоны запросов") { box, dlg ->
+            box.addView(TextView(this).apply {
+                text = "Нажмите, чтобы вставить. Или наберите /имя в сообщении — оно развернётся при отправке. Долгое нажатие — удалить."
+                setTextColor(Theme.MUTED); textSize = 12.5f
+                setPadding(dp(4), 0, dp(4), dp(10))
+            })
+            for ((name, text) in templates()) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = Md.rippleRect(Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE))
+                    setPadding(dp(16), dp(11), dp(16), dp(11))
+                    setOnClickListener {
+                        dlg.dismiss()
+                        val cur = input.text.toString().trim()
+                        input.setText(if (cur.isEmpty()) text else "$text\n\n$cur")
+                        input.setSelection(input.text.length)
+                        input.requestFocus()
+                    }
+                    setOnLongClickListener {
+                        AlertDialog.Builder(this@MainActivity).setTitle("Удалить /$name?")
+                            .setPositiveButton("Удалить") { _, _ ->
+                                saveTemplates(templates().filter { it.first != name })
+                                dlg.dismiss()
+                                openTemplates()
+                            }.setNegativeButton("Отмена", null).show()
+                        true
+                    }
+                }
+                row.addView(TextView(this).apply { this.text = "/$name"; setTextColor(Theme.ACCENT); textSize = 15f; typeface = Typeface.DEFAULT_BOLD })
+                row.addView(TextView(this).apply { this.text = text; setTextColor(Theme.MUTED); textSize = 12.5f; maxLines = 2; ellipsize = TextUtils.TruncateAt.END })
+                box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            box.addView(gradientButton("+  Новый шаблон") {
+                dlg.dismiss()
+                val form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+                val n = EditText(this).apply { hint = "Имя без слэша, например: docs"; setSingleLine() }
+                val t = EditText(this).apply { hint = "Текст запроса"; minLines = 3; gravity = Gravity.TOP; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE }
+                form.addView(n); form.addView(t)
+                AlertDialog.Builder(this).setTitle("Новый шаблон").setView(form)
+                    .setPositiveButton("Сохранить") { _, _ ->
+                        val nm = n.text.toString().trim().removePrefix("/").replace(Regex("\\s+"), "-")
+                        val tx = t.text.toString().trim()
+                        if (nm.isNotEmpty() && tx.isNotEmpty()) {
+                            saveTemplates(templates().filter { !it.first.equals(nm, true) } + (nm to tx))
+                            openTemplates()
+                        }
+                    }.setNegativeButton("Отмена", null).show()
+            }, lp(-1, -2).apply { topMargin = dp(4) })
+        }
+    }
+
+    // ---------- export chat ----------
+
+    private fun threadMarkdown(): String {
+        val sb = StringBuilder()
+        sb.append("# ").append(curTitle.ifEmpty { "Задача Qwen Coder" }).append("\n\n")
+        if (curRepo.isNotEmpty()) sb.append("_").append(curRepo).append("_\n\n")
+        for (m in thread) {
+            if (m.role == "user") {
+                if (Sandbox.isService(m.text)) continue
+                sb.append("## Вы\n\n").append(m.text).append("\n\n")
+            } else {
+                sb.append("## Qwen Coder\n\n")
+                if (m.work.isNotBlank()) sb.append(m.work.trim()).append("\n\n")
+                if (m.text.isNotBlank()) sb.append(m.text.trim()).append("\n\n")
+                val sh = m.steps.filter { it.type.equals("Shell", true) && it.action.isNotBlank() }
+                if (sh.isNotEmpty()) {
+                    sb.append("<details><summary>Команды агента</summary>\n\n```\n")
+                    for (s in sh) sb.append("$ ").append(s.action.trim()).append("\n")
+                    sb.append("```\n</details>\n\n")
+                }
+                if (m.commit.isNotEmpty()) sb.append("Коммит: `").append(m.commit.take(10)).append("`\n\n")
+            }
+        }
+        return sb.toString().trimEnd() + "\n"
+    }
+
+    private fun exportMarkdown() {
+        val md = threadMarkdown()
+        val base = "qwen-" + curTitle.ifEmpty { curId.orEmpty().take(8) }.replace(Regex("[^\\p{L}\\p{N}_-]+"), "-").take(40)
+        sheet("Экспорт чата") { box, dlg ->
+            fun row(t: String, sub: String, a: () -> Unit) {
+                val r = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = Md.rippleRect(Md.round(Theme.SURFACE, 14, this@MainActivity, Theme.STROKE))
+                    setPadding(dp(16), dp(12), dp(16), dp(12))
+                    setOnClickListener { dlg.dismiss(); a() }
+                }
+                r.addView(TextView(this).apply { text = t; setTextColor(Theme.TEXT); textSize = 15.5f })
+                r.addView(TextView(this).apply { text = sub; setTextColor(Theme.MUTED); textSize = 12.5f })
+                box.addView(r, lp(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            row("Поделиться текстом", "Отправить Markdown в другое приложение") {
+                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain")
+                    .putExtra(Intent.EXTRA_SUBJECT, curTitle).putExtra(Intent.EXTRA_TEXT, md), "Экспорт чата"))
+            }
+            row("Сохранить файл .md", "В папку «Загрузки»") {
+                pool.execute {
+                    val ok = try { saveDownload("$base.md", "text/markdown", md.toByteArray()) } catch (_: Exception) { false }
+                    ui.post { toast(if (ok) "Сохранено в Загрузки: $base.md" else "Сохранение доступно на Android 10+ — используйте «Поделиться»") }
+                }
+            }
+            row("Скопировать", "В буфер обмена") { Md.copy(this, md) }
+        }
+    }
+
+    private fun fileAction(path: String, bytes: ByteArray, share: Boolean) {
+        val name = path.substringAfterLast('/')
+        if (share) {
+            if (!Sandbox.isText(bytes)) { toast("Бинарный файл можно только сохранить"); return }
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(Intent.EXTRA_SUBJECT, name).putExtra(Intent.EXTRA_TEXT, String(bytes, Charsets.UTF_8).take(200_000)), name))
+        } else {
+            pool.execute {
+                val ok = try { saveDownload(name, if (Sandbox.isText(bytes)) "text/plain" else "application/octet-stream", bytes) } catch (_: Exception) { false }
+                ui.post { toast(if (ok) "Сохранено в Загрузки: $name" else "Сохранение доступно на Android 10+") }
+            }
+        }
+    }
+
     // ---------- menu ----------
 
     private fun openUrl(url: String) {
@@ -2492,6 +2967,8 @@ class MainActivity : Activity() {
                 item("Превью проекта", "Открыть в окне кода") { openCode(3) }
                 item("Файлы из песочницы", "Выгрузить проект через агента") { openCode(1) }
                 item("Открыть задачу на сайте") { openUrl("https://coder.qwen.ai/c/$id") }
+                if (thread.isNotEmpty()) item("Экспорт чата в Markdown", "Поделиться или сохранить в «Загрузки»") { exportMarkdown() }
+                prUrl()?.let { u -> item("Создать Pull Request", "$prHead → ${prBase.ifEmpty { "main" }} на GitHub") { openUrl(u) } }
                 item("Сохранить данные задачи", "Файл JSON в «Загрузки» для отладки") { exportTask(id) }
             }
             item("Репозитории и GitHub", "Подключить на сайте, список обновится сам") {
@@ -2577,6 +3054,10 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 4001) {
+            authPending = false
+            if (resultCode == RESULT_OK) unlock()
+        }
         if (requestCode == 3001 && resultCode == RESULT_OK) {
             val rt = data?.getStringExtra("refresh")
             if (!rt.isNullOrEmpty()) doLogin(rt)
@@ -2584,6 +3065,9 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        lastActive = android.os.SystemClock.elapsedRealtime()
+        notify?.stop()
+        notify = null
         WatchService.visible = false
         if (api.loggedIn && (streaming || running)) WatchService.start(this)
         super.onPause()
@@ -2593,6 +3077,8 @@ class MainActivity : Activity() {
         super.onResume()
         WatchService.visible = true
         WatchService.stop(this)
+        if (lockOn && !authPending && (locked || android.os.SystemClock.elapsedRealtime() - lastActive > 30_000)) lockNow()
+        if (api.loggedIn && notify == null) notify = NotifySocket(api) { ui.post { onPull() } }.also { it.start() }
         if (api.loggedIn) loadTasks()
         if ((streaming || running) && curId != null) startPolling()
         if (refreshEnvsOnResume && api.loggedIn) {
@@ -2608,6 +3094,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        notify?.stop()
         ui.removeCallbacksAndMessages(null)
         statusAnim?.cancel()
         api.cancelStream()

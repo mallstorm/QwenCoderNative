@@ -37,7 +37,8 @@ data class Usage(val remaining: Int, val status: String, val member: String, val
 data class ChatMsg(
     val id: String, val role: String, val text: String, val steps: List<Step>,
     val thinking: String, val error: String?, val done: Boolean,
-    val files: List<FileChange> = emptyList(), val commit: String = "", val work: String = ""
+    val files: List<FileChange> = emptyList(), val commit: String = "", val work: String = "",
+    val parent: String = "", val sibs: List<String> = emptyList()
 )
 
 /** Extracts Qwen tokens from whatever the user pastes (raw JWT, "refresh_token=...", Cookie header, JSON export). */
@@ -443,11 +444,60 @@ class Api(ctx: Context) {
         call("POST", "$CODER/api/v2/users/user/settings/update", s)
     }
 
+    private fun parseUsage(body: String): Usage? {
+        val d = JSONObject(body).optJSONObject("data") ?: return null
+        return Usage(d.optInt("remainingPercent", -1), d.optString("status"), d.optString("memberType"), d.optLong("resetAt"))
+    }
+
+    private val usageUrl = "https://sg-entitlement.qwen.com/api/entitlement/agent/usage?biz_id=ai_qwen&chat_client=h5&device=pc&fr=pc&pr=qwen-i18n&la=ru-RU&tz=Etc%2FGMT-3&wv=$VERSION"
+
     fun usage(): Usage? = try {
-        val url = "https://sg-entitlement.qwen.com/api/entitlement/agent/usage?biz_id=ai_qwen&chat_client=h5&device=pc&fr=pc&pr=qwen-i18n&la=ru-RU&tz=Etc%2FGMT-3&wv=$VERSION"
-        val r = exec("GET", url, null, ensureAccess(), null, false)
-        val d = JSONObject(r.body).optJSONObject("data")
-        if (d == null) null else Usage(d.optInt("remainingPercent", -1), d.optString("status"), d.optString("memberType"), d.optLong("resetAt"))
+        parseUsage(exec("GET", usageUrl, null, ensureAccess(), null, false).body)
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Access token of any saved account (refreshes and stores it when expired). */
+    @Synchronized
+    private fun accessFor(key: String): String? {
+        if (key == activeKey) return ensureAccess()
+        val arr = store()
+        val i = find(arr, key)
+        if (i < 0) return null
+        val o = arr.getJSONObject(i)
+        val a = str(o, "access")
+        if (a != null) {
+            val exp = TokenParser.payload(a)?.optLong("exp", 0L) ?: 0L
+            if (exp == 0L || exp * 1000 - System.currentTimeMillis() > 60_000) return a
+        }
+        val rt = str(o, "refresh") ?: return a
+        val r = exec("GET", "$AUTH/api/v2/auths/refresh", null, null, "refresh_token=$rt", false)
+        val j = JSONObject(r.body)
+        if (!j.optBoolean("success")) return null
+        val d = j.getJSONObject("data")
+        val na = d.optString("access_token").ifEmpty { null }
+        val nr = d.optString("refresh_token").ifEmpty { null }
+        if (na != null) o.put("access", na)
+        if (nr != null) o.put("refresh", nr)
+        arr.put(i, o)
+        prefs.edit().putString("accounts", arr.toString()).apply()
+        return na ?: a
+    }
+
+    fun usageFor(key: String): Usage? = try {
+        val t = accessFor(key)
+        if (t == null) null else parseUsage(exec("GET", usageUrl, null, t, null, false).body)
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Parameters for the notifications WebSocket. */
+    fun wsUrl(): String? = try {
+        val t = ensureAccess()
+        val uid = TokenParser.payload(t)?.optString("id").orEmpty()
+        var dev = prefs.getString("device_id", null)
+        if (dev == null) { dev = UUID.randomUUID().toString(); prefs.edit().putString("device_id", dev).apply() }
+        "/api/v1/notifications/ws?user_id=$uid&device_type=web&device_id=$dev&xid=${UUID.randomUUID()}&token=$t"
     } catch (_: Exception) {
         null
     }
@@ -735,23 +785,51 @@ class Api(ctx: Context) {
         }
     }
 
-    fun parseThread(data: JSONObject): List<ChatMsg> {
+    fun parseThread(data: JSONObject, choice: Map<String, String> = emptyMap()): List<ChatMsg> {
         val hist = data.optJSONObject("task")?.optJSONObject("history") ?: return emptyList()
         val msgs = hist.optJSONObject("messages") ?: return emptyList()
-        var cur: String = if (hist.isNull("currentId")) (if (data.isNull("currentId")) "" else data.optString("currentId")) else hist.optString("currentId")
-        val chain = ArrayList<JSONObject>()
-        val seen = HashSet<String>()
-        while (cur.isNotEmpty() && msgs.has(cur) && seen.add(cur)) {
-            val m = msgs.getJSONObject(cur)
-            chain.add(m)
-            if (m.isNull("parentId")) break
-            cur = m.optString("parentId")
+        val cur: String = if (hist.isNull("currentId")) (if (data.isNull("currentId")) "" else data.optString("currentId")) else hist.optString("currentId")
+        // path of the saved "current" branch
+        val onCur = HashSet<String>()
+        run {
+            var c = cur
+            while (c.isNotEmpty() && msgs.has(c) && onCur.add(c)) {
+                val m = msgs.getJSONObject(c)
+                if (m.isNull("parentId")) break
+                c = m.optString("parentId")
+            }
         }
-        chain.reverse()
+        val childMap = HashMap<String, ArrayList<Pair<Long, String>>>()
+        run {
+            val it = msgs.keys()
+            while (it.hasNext()) {
+                val k = it.next()
+                val m = msgs.optJSONObject(k) ?: continue
+                val pid = if (m.isNull("parentId")) "" else m.optString("parentId")
+                if (pid.isEmpty() && m.optString("role") != "user") continue
+                childMap.getOrPut(pid) { ArrayList() }.add(Pair(m.optLong("timestamp"), k))
+            }
+        }
+        fun kids(id: String): List<String> = childMap[id]?.sortedBy { it.first }?.map { it.second } ?: emptyList()
+        val chain = ArrayList<JSONObject>()
+        val sibsOf = HashMap<String, List<String>>()
+        var parent = ""
+        val seen = HashSet<String>()
+        while (true) {
+            val ks = kids(parent)
+            if (ks.isEmpty()) break
+            val pick = choice[parent]?.takeIf { it in ks } ?: ks.firstOrNull { it in onCur } ?: ks.last()
+            if (!seen.add(pick)) break
+            val m = msgs.getJSONObject(pick)
+            sibsOf[pick] = ks.filter { msgs.getJSONObject(it).optString("role") == m.optString("role") }
+            chain.add(m)
+            parent = pick
+        }
+        if (chain.isEmpty()) return emptyList()
         return chain.map { m ->
             val role = m.optString("role")
             if (role == "user") {
-                ChatMsg(m.optString("id"), "user", m.optString("content"), emptyList(), "", null, true)
+                ChatMsg(m.optString("id"), "user", m.optString("content"), emptyList(), "", null, true, parent = if (m.isNull("parentId")) "" else m.optString("parentId"), sibs = sibsOf[m.optString("id")].orEmpty())
             } else {
                 val answer = StringBuilder()
                 val think = StringBuilder()

@@ -28,7 +28,8 @@ class CodePanel(
     private val onOpenBrowser: (String) -> Unit,
     private val onFetch: () -> Unit,
     private val onStartPreview: () -> Unit,
-    private val onSave: () -> Unit
+    private val onSave: () -> Unit,
+    private val onFile: (String, ByteArray, Boolean) -> Unit = { _, _, _ -> }
 ) : LinearLayout(ctx) {
 
     private var tab = 0
@@ -47,6 +48,7 @@ class CodePanel(
     private var sig = ""
     private var active = false
     private val expanded = HashSet<String>()
+    private var fileQuery = ""
     private val tabViews = ArrayList<TextView>()
     private val body = FrameLayout(ctx)
     private val titleView: TextView
@@ -423,7 +425,43 @@ class CodePanel(
         }
         box.addView(head, LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
         if (sb != null) {
+            val search = android.widget.EditText(context).apply {
+                hint = "Поиск по файлам и их содержимому"
+                setHintTextColor(Theme.MUTED)
+                setTextColor(Theme.TEXT)
+                textSize = 13.5f
+                setSingleLine()
+                background = Md.round(Theme.SURFACE2, 12, context)
+                setPadding(dp(12), dp(9), dp(12), dp(9))
+                setText(fileQuery)
+                setSelection(text.length)
+                imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+                setOnEditorActionListener { v, _, _ ->
+                    fileQuery = v.text.toString().trim()
+                    render()
+                    true
+                }
+            }
+            box.addView(search, LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+            val q = fileQuery.lowercase()
+            var shownCount = 0
             for ((path, bytes) in sb) {
+                var hits = 0
+                if (q.isNotEmpty()) {
+                    val inName = path.lowercase().contains(q)
+                    if (Sandbox.isText(bytes)) {
+                        var from = 0
+                        val txt = String(bytes, Charsets.UTF_8).lowercase()
+                        while (hits < 99) {
+                            val i = txt.indexOf(q, from)
+                            if (i < 0) break
+                            hits++
+                            from = i + q.length
+                        }
+                    }
+                    if (!inName && hits == 0) continue
+                }
+                shownCount++
                 val key = "f:$path"
                 val card = LinearLayout(context).apply {
                     orientation = VERTICAL
@@ -447,13 +485,25 @@ class CodePanel(
                     ellipsize = android.text.TextUtils.TruncateAt.START
                 }, LayoutParams(0, -2, 1f))
                 row.addView(TextView(context).apply {
-                    text = if (bytes.size < 1024) "${bytes.size} Б" else "${bytes.size / 1024} КБ"
+                    text = (if (hits > 0) "совп. $hits · " else "") + if (bytes.size < 1024) "${bytes.size} Б" else "${bytes.size / 1024} КБ"
                     setTextColor(Theme.MUTED)
                     textSize = 11.5f
                     setPadding(dp(8), 0, 0, 0)
                 })
                 card.addView(row, LayoutParams(-1, -2))
                 if (expanded.contains(key)) {
+                    val acts = LinearLayout(context).apply { setPadding(dp(12), 0, dp(12), dp(6)) }
+                    for ((label, share) in listOf("Отправить" to true, "Сохранить" to false)) {
+                        acts.addView(TextView(context).apply {
+                            text = label
+                            setTextColor(Theme.ACCENT)
+                            textSize = 12.5f
+                            background = Md.round(Theme.SURFACE2, 10, context)
+                            setPadding(dp(12), dp(6), dp(12), dp(6))
+                            setOnClickListener { onFile(path, bytes, share) }
+                        }, LayoutParams(-2, -2).apply { rightMargin = dp(8) })
+                    }
+                    card.addView(acts, LayoutParams(-1, -2))
                     if (Sandbox.isText(bytes)) {
                         val t = String(bytes, Charsets.UTF_8)
                         card.addView(Md.codeBlock(context, if (t.length > 60000) t.take(60000) + "\n…" else t, path.substringAfterLast('.', "")))
@@ -468,6 +518,7 @@ class CodePanel(
                 }
                 box.addView(card, LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
             }
+            if (q.isNotEmpty() && shownCount == 0) box.addView(empty("Ничего не найдено."))
         }
         scrollOf(box)
     }
