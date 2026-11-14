@@ -255,7 +255,7 @@ class MainActivity : Activity() {
             textSize = 11.5f
             gravity = Gravity.CENTER
         }, lp(-1, -2).apply { topMargin = dp(14) })
-        scroll.addView(box, ScrollView.LayoutParams(-1, -2))
+        scroll.addView(box, FrameLayout.LayoutParams(-1, -2))
         return scroll
     }
 
