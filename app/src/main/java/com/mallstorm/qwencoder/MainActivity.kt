@@ -218,48 +218,44 @@ class MainActivity : Activity() {
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(24), dp(22), dp(24), dp(30))
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            setPadding(dp(22), dp(10), dp(22), dp(24))
         }
-        val eyebrow = TextView(this).apply {
-            text = "WORKSPACE  /  DESIGN STUDIO"
-            setTextColor(Theme.ACCENT)
-            textSize = 11f
-            letterSpacing = 0.13f
-            gravity = Gravity.CENTER
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        box.addView(eyebrow, lp(-1, -2).apply { bottomMargin = dp(18) })
-        val artworkContainer = FrameLayout(this).apply {
-            background = Md.round(Theme.SURFACE, 22, this@MainActivity, Theme.STROKE)
-            setPadding(dp(3), dp(3), dp(3), dp(3))
+        // Raster illustration, deliberately at the TOP of the lock screen.
+        // Android's credential/biometric confirmation normally appears lower down.
+        val art = FrameLayout(this).apply {
+            background = Md.round(Theme.SURFACE, 20, this@MainActivity)
             clipToOutline = true
-            contentDescription = "Архитектор рисует проект интерфейса на чертёжном столе"
+            contentDescription = "Архитектор рисует интерфейс на чертёжном столе"
         }
-        artworkContainer.addView(DraftingRoomArtwork(this), FrameLayout.LayoutParams(-1, -1))
-        box.addView(artworkContainer, lp(-1, dp(284)))
+        art.addView(ImageView(this).apply {
+            setImageResource(R.drawable.lock_architect)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            contentDescription = "Вечерняя студия архитектора"
+        }, FrameLayout.LayoutParams(-1, -1))
+        val maxArtHeight = minOf(dp(350), (resources.displayMetrics.heightPixels * 0.43f).toInt())
+        box.addView(art, lp(-1, maxArtHeight))
         box.addView(TextView(this).apply {
             text = "Мастерская идей"
             setTextColor(Theme.TEXT)
-            textSize = 25f
+            textSize = 23f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-        }, lp(-1, -2).apply { topMargin = dp(24) })
+        }, lp(-1, -2).apply { topMargin = dp(18) })
         box.addView(TextView(this).apply {
-            text = "Ваше рабочее пространство готово.\nПродолжайте создавать."
+            text = "Продолжайте создавать"
             setTextColor(Theme.MUTED)
-            textSize = 14f
+            textSize = 13.5f
             gravity = Gravity.CENTER
-            setLineSpacing(dp(3).toFloat(), 1f)
-        }, lp(-1, -2).apply { topMargin = dp(9); bottomMargin = dp(25) })
+        }, lp(-1, -2).apply { topMargin = dp(6); bottomMargin = dp(20) })
         box.addView(gradientButton("Продолжить работу") { askUnlock() }, lp(-1, -2))
         box.addView(TextView(this).apply {
-            text = "Вход по PIN, паролю или биометрии устройства"
+            text = "PIN, пароль или биометрия устройства"
             setTextColor(Theme.MUTED)
             textSize = 11.5f
             gravity = Gravity.CENTER
-        }, lp(-1, -2).apply { topMargin = dp(16) })
-        scroll.addView(box, FrameLayout.LayoutParams(-1, -1))
+        }, lp(-1, -2).apply { topMargin = dp(14) })
+        scroll.addView(box, ScrollView.LayoutParams(-1, -2))
         return scroll
     }
 
@@ -574,6 +570,8 @@ class MainActivity : Activity() {
         }
         val composer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            // Otherwise the EditText baseline lifts the "/" button as text grows.
+            isBaselineAligned = false
             gravity = Gravity.BOTTOM
             background = Md.round(Theme.SURFACE, 26, this@MainActivity, Theme.STROKE)
             setPadding(dp(18), dp(4), dp(5), dp(5))
@@ -595,8 +593,8 @@ class MainActivity : Activity() {
             setTextColor(Theme.MUTED); textSize = 22f; gravity = Gravity.CENTER
             contentDescription = "Шаблоны"
             setOnClickListener { openTemplates() }
-        }, lp(dp(34), dp(40)))
-        composer.addView(micBtn, lp(dp(40), dp(40)))
+        }, lp(dp(34), dp(40)).apply { gravity = Gravity.BOTTOM })
+        composer.addView(micBtn, lp(dp(40), dp(40)).apply { gravity = Gravity.BOTTOM })
         sendBtn = ImageButton(this).apply {
             setImageResource(R.drawable.ic_send)
             setColorFilter(Color.WHITE)
@@ -606,7 +604,10 @@ class MainActivity : Activity() {
             setPadding(dp(9), dp(9), dp(9), dp(9))
             setOnClickListener { send() }
         }
-        composer.addView(sendBtn, lp(dp(40), dp(40)).apply { leftMargin = dp(2) })
+        composer.addView(sendBtn, lp(dp(40), dp(40)).apply {
+            leftMargin = dp(2)
+            gravity = Gravity.BOTTOM
+        })
         editBar = TextView(this).apply {
             text = "✎  Редактирование сообщения — будет создана новая ветка   ✕"
             setTextColor(Theme.ACCENT); textSize = 12.5f
