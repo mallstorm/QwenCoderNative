@@ -119,7 +119,7 @@ class MainActivity : Activity() {
     private var locked = false
     private var authPending = false
     private lateinit var lockView: View
-    private val switchAsked = HashSet<String>()
+    private lateinit var savedAccountsBtn: TextView
     private var onlyRunning = false
     private var query = ""
     private var pinnedTasks: List<TaskItem> = emptyList()
@@ -183,7 +183,7 @@ class MainActivity : Activity() {
         if (Theme.light) window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         lockOn = prefs.getBoolean("applock", false)
-        if (lockOn) window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        // Screenshots are allowed; device PIN / biometrics still gate access.
 
         val root = FrameLayout(this).apply { setBackgroundColor(Theme.BG) }
         drawer = buildMain()
@@ -208,19 +208,59 @@ class MainActivity : Activity() {
 
     // ---------- app lock ----------
 
-    private fun buildLock(): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-        setBackgroundColor(Theme.BG)
-        isClickable = true
-        visibility = View.GONE
-        addView(Md.logoView(this@MainActivity, 64), lp(dp(64), dp(64)))
-        addView(TextView(this@MainActivity).apply {
-            text = "Qwen Coder заблокирован"
-            setTextColor(Theme.TEXT); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(16), 0, 0)
-        })
-        addView(gradientButton("Разблокировать") { askUnlock() }, lp(dp(220), -2).apply { topMargin = dp(24) })
+    private fun buildLock(): View {
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(Theme.BG)
+            isClickable = true
+            visibility = View.GONE
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(22), dp(24), dp(30))
+        }
+        val eyebrow = TextView(this).apply {
+            text = "WORKSPACE  /  DESIGN STUDIO"
+            setTextColor(Theme.ACCENT)
+            textSize = 11f
+            letterSpacing = 0.13f
+            gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        box.addView(eyebrow, lp(-1, -2).apply { bottomMargin = dp(18) })
+        val artworkContainer = FrameLayout(this).apply {
+            background = Md.round(Theme.SURFACE, 22, this@MainActivity, Theme.STROKE)
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            clipToOutline = true
+            contentDescription = "Архитектор рисует проект интерфейса на чертёжном столе"
+        }
+        artworkContainer.addView(DraftingRoomArtwork(this), FrameLayout.LayoutParams(-1, -1))
+        box.addView(artworkContainer, lp(-1, dp(284)))
+        box.addView(TextView(this).apply {
+            text = "Мастерская идей"
+            setTextColor(Theme.TEXT)
+            textSize = 25f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }, lp(-1, -2).apply { topMargin = dp(24) })
+        box.addView(TextView(this).apply {
+            text = "Ваше рабочее пространство готово.\nПродолжайте создавать."
+            setTextColor(Theme.MUTED)
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setLineSpacing(dp(3).toFloat(), 1f)
+        }, lp(-1, -2).apply { topMargin = dp(9); bottomMargin = dp(25) })
+        box.addView(gradientButton("Продолжить работу") { askUnlock() }, lp(-1, -2))
+        box.addView(TextView(this).apply {
+            text = "Вход по PIN, паролю или биометрии устройства"
+            setTextColor(Theme.MUTED)
+            textSize = 11.5f
+            gravity = Gravity.CENTER
+        }, lp(-1, -2).apply { topMargin = dp(16) })
+        scroll.addView(box, FrameLayout.LayoutParams(-1, -1))
+        return scroll
     }
 
     private fun lockNow() {
@@ -393,6 +433,8 @@ class MainActivity : Activity() {
         }
         box.addView(loginStatus, lp(-1, -2))
         box.addView(gradientButton("Войти по токену") { doLogin(tokenInput.text.toString()) }, lp(-1, -2))
+        savedAccountsBtn = outlineButton("Выбрать сохранённый аккаунт") { openAccounts() }
+        box.addView(savedAccountsBtn, lp(-1, -2).apply { topMargin = dp(10) })
         box.addView(outlineButton("Войти в окне Qwen (GitHub или почта)") {
             startActivityForResult(Intent(this, WebLoginActivity::class.java), 3001)
         }, lp(-1, -2).apply { topMargin = dp(10) })
@@ -737,41 +779,18 @@ class MainActivity : Activity() {
     }
 
     private fun loadUsage() {
+        val account = api.activeAccount
         pool.execute {
             val u = api.usage()
             ui.post {
-                if (u == null || u.remaining < 0) return@post
+                if (account != api.activeAccount || u == null || u.remaining < 0) return@post
                 usageView.text = usageText(u)
                 usageView.setTextColor(usageColor(u))
                 usageView.visibility = View.VISIBLE
-                if (u.remaining == 0 && switchAsked.add(api.activeAccount)) suggestSwitch()
             }
         }
     }
 
-    /** Current account is out of credits: offer another saved account that still has some. */
-    private fun suggestSwitch() {
-        val cur = api.activeAccount
-        pool.execute {
-            var best: Pair<Api.Account, Usage>? = null
-            for (a in api.accounts()) {
-                if (a.key == cur) continue
-                val u = api.usageFor(a.key) ?: continue
-                val b = best
-                if (u.remaining > 0 && (b == null || u.remaining > b.second.remaining)) best = Pair(a, u)
-            }
-            val found = best ?: return@execute
-            ui.post {
-                AlertDialog.Builder(this).setTitle("Кредиты закончились")
-                    .setMessage("Переключиться на «${found.first.name.ifEmpty { found.first.email }}»? Там осталось ${found.second.remaining}%.")
-                    .setPositiveButton("Переключить") { _, _ ->
-                        api.switchTo(found.first.key)
-                        recreate()
-                    }
-                    .setNegativeButton("Нет", null).show()
-            }
-        }
-    }
 
     private fun onPull() {
         if (!api.loggedIn) return
@@ -875,7 +894,7 @@ class MainActivity : Activity() {
         val lockRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val lt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         lt.addView(TextView(this).apply { text = "Блокировка приложения"; setTextColor(Theme.TEXT); textSize = 14.5f })
-        lt.addView(TextView(this).apply { text = "Отпечаток пальца, PIN или графический ключ устройства. Токены аккаунтов хранятся на телефоне; в списке недавних экран скрывается."; setTextColor(Theme.MUTED); textSize = 12f })
+        lt.addView(TextView(this).apply { text = "PIN, пароль или биометрия устройства. Скриншоты и показ экрана разрешены для визуальной отладки."; setTextColor(Theme.MUTED); textSize = 12f })
         lockRow.addView(lt, lp(0, -2, 1f))
         lockRow.addView(android.widget.Switch(this).apply {
             isChecked = lockOn
@@ -887,8 +906,7 @@ class MainActivity : Activity() {
                 } else {
                     prefs.edit().putBoolean("applock", on).apply()
                     lockOn = on
-                    if (on) this@MainActivity.window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-                    else this@MainActivity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    // The screen lock is independent of screenshot permissions.
                 }
             }
         })
@@ -1046,6 +1064,7 @@ class MainActivity : Activity() {
     // ---------- screens / session ----------
 
     private fun showLogin() {
+        savedAccountsBtn.visibility = if (api.accounts().isEmpty()) View.GONE else View.VISIBLE
         loginView.visibility = View.VISIBLE
         drawer.visibility = View.GONE
     }
@@ -1081,11 +1100,6 @@ class MainActivity : Activity() {
     private fun logout() {
         api.cancelStream()
         api.logout()
-        if (api.loggedIn) {
-            toast("Аккаунт: " + api.userName.ifEmpty { api.userEmail })
-            recreate()
-            return
-        }
         curId = null
         thread = emptyList()
         tasks = emptyList()
@@ -1100,7 +1114,7 @@ class MainActivity : Activity() {
             val who = api.userName.ifEmpty { api.userEmail }
             api.logout()
             toast("Сессия $who истекла: войдите в этот аккаунт заново")
-            if (api.loggedIn) recreate() else showLogin()
+            recreate()
         } else {
             toast(e.message ?: "Ошибка сети")
         }
@@ -1143,7 +1157,6 @@ class MainActivity : Activity() {
     private fun openAccounts() {
         sheet("Аккаунты Qwen") { box, dlg ->
             val list = api.accounts()
-            val uvs = HashMap<String, TextView>()
             for (a in list) {
                 val on = a.key == api.activeAccount
                 val row = LinearLayout(this).apply {
@@ -1168,9 +1181,11 @@ class MainActivity : Activity() {
                 val tb = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                 tb.addView(TextView(this).apply { text = n; setTextColor(Theme.TEXT); textSize = 15f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
                 if (a.email.isNotEmpty() && a.email != n) tb.addView(TextView(this).apply { text = a.email; setTextColor(Theme.MUTED); textSize = 12.5f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
-                val uv = TextView(this).apply { text = "кредиты: загрузка…"; setTextColor(Theme.MUTED); textSize = 12f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
-                tb.addView(uv)
-                uvs[a.key] = uv
+                tb.addView(TextView(this).apply {
+                    text = if (on) "Текущий аккаунт · кредиты в боковой панели" else "Отдельная сессия · нажмите для входа"
+                    setTextColor(Theme.MUTED)
+                    textSize = 12f
+                })
                 row.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
                 if (on) row.addView(ImageView(this).apply {
                     setImageResource(R.drawable.ic_check); setColorFilter(Color.WHITE)
@@ -1178,12 +1193,6 @@ class MainActivity : Activity() {
                     setPadding(dp(5), dp(5), dp(5), dp(5))
                 }, lp(dp(24), dp(24)))
                 box.addView(row, lp(-1, -2).apply { bottomMargin = dp(8) })
-            }
-            for (a in list) pool.execute {
-                val u = api.usageFor(a.key)
-                ui.post {
-                    if (dlg.isShowing) uvs[a.key]?.let { it.text = usageText(u); it.setTextColor(usageColor(u)) }
-                }
             }
             box.addView(gradientButton("+  Добавить аккаунт") {
                 dlg.dismiss()
@@ -1211,6 +1220,8 @@ class MainActivity : Activity() {
 
     // ---------- repositories ----------
 
+    private fun accountPref(key: String): String = "account_" + api.activeAccount + "_" + key
+
     private fun defaultBranch(e: Env): String =
         e.branches.firstOrNull { it == "main" } ?: e.branches.firstOrNull { it == "master" } ?: e.branches.firstOrNull().orEmpty()
 
@@ -1236,12 +1247,12 @@ class MainActivity : Activity() {
 
     private fun restoreSelection() {
         val list = envs ?: return
-        val keep = selEnv?.id ?: prefs.getString("last_env_id", null)
+        val keep = selEnv?.id ?: prefs.getString(accountPref("last_env_id"), null)
         val e = list.firstOrNull { it.id == keep }
         if (e != null) {
             selEnv = e
             val b = if (selBranch.isNotEmpty() && selEnv?.id == e.id && e.branches.contains(selBranch)) selBranch
-            else prefs.getString("branch_" + e.id, null)?.takeIf { e.branches.contains(it) } ?: defaultBranch(e)
+            else prefs.getString(accountPref("branch_" + e.id), null)?.takeIf { e.branches.contains(it) } ?: defaultBranch(e)
             selBranch = b
         } else {
             selEnv = null
@@ -1389,7 +1400,7 @@ class MainActivity : Activity() {
                 listBox.addView(row("Без репозитория", "Свободный чат без привязки к коду", selEnv == null, R.drawable.ic_sparkle) {
                     selEnv = null
                     selBranch = ""
-                    prefs.edit().remove("last_env_id").apply()
+                    prefs.edit().remove(accountPref("last_env_id")).apply()
                     updateChips()
                     dlg.dismiss()
                 })
@@ -1479,7 +1490,7 @@ class MainActivity : Activity() {
                         setPadding(dp(18), dp(18), dp(18), dp(8))
                     })
                 }
-                val curBranch = if (selEnv?.id == e.id) selBranch else prefs.getString("branch_" + e.id, "").orEmpty()
+                val curBranch = if (selEnv?.id == e.id) selBranch else prefs.getString(accountPref("branch_" + e.id), "").orEmpty()
                 for (b in shown) {
                     val meta = e.branchMeta[b]
                     val history = branchHistories[key(b)]
@@ -1507,7 +1518,7 @@ class MainActivity : Activity() {
                     listBox.addView(row(b, details.joinToString("\n"), b == curBranch, R.drawable.ic_repo) {
                         selEnv = e
                         selBranch = b
-                        prefs.edit().putString("last_env_id", e.id).putString("branch_" + e.id, b).apply()
+                        prefs.edit().putString(accountPref("last_env_id"), e.id).putString(accountPref("branch_" + e.id), b).apply()
                         updateChips()
                         dlg.dismiss()
                     })
@@ -2021,7 +2032,7 @@ class MainActivity : Activity() {
         drawer.closeDrawers()
         input.requestFocus()
         loadEnvs(false) {
-            if (selEnv == null && !prefs.contains("last_env_id") && (envs?.isNotEmpty() == true)) openRepoPicker()
+            if (selEnv == null && !prefs.contains(accountPref("last_env_id")) && (envs?.isNotEmpty() == true)) openRepoPicker()
         }
     }
 

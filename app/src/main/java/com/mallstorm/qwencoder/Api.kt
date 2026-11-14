@@ -198,13 +198,13 @@ class Api(ctx: Context) {
         persist()
     }
 
-    /** Removes the active account; switches to the next saved one if there is any. */
+    /** Removes only the current account. Other accounts remain saved but are never selected automatically. */
     @Synchronized
     fun logout() {
         val arr = store()
         val i = find(arr, activeKey)
         if (i >= 0) arr.remove(i)
-        activeKey = if (arr.length() > 0) arr.getJSONObject(0).optString("key") else ""
+        activeKey = ""
         prefs.edit().putString("accounts", arr.toString()).putString("active", activeKey).apply()
         loadActive()
     }
@@ -474,40 +474,6 @@ class Api(ctx: Context) {
 
     fun usage(): Usage? = try {
         parseUsage(exec("GET", usageUrl, null, ensureAccess(), null, false).body)
-    } catch (_: Exception) {
-        null
-    }
-
-    /** Access token of any saved account (refreshes and stores it when expired). */
-    @Synchronized
-    private fun accessFor(key: String): String? {
-        if (key == activeKey) return ensureAccess()
-        val arr = store()
-        val i = find(arr, key)
-        if (i < 0) return null
-        val o = arr.getJSONObject(i)
-        val a = str(o, "access")
-        if (a != null) {
-            val exp = TokenParser.payload(a)?.optLong("exp", 0L) ?: 0L
-            if (exp == 0L || exp * 1000 - System.currentTimeMillis() > 60_000) return a
-        }
-        val rt = str(o, "refresh") ?: return a
-        val r = exec("GET", "$AUTH/api/v2/auths/refresh", null, null, "refresh_token=$rt", false)
-        val j = JSONObject(r.body)
-        if (!j.optBoolean("success")) return null
-        val d = j.getJSONObject("data")
-        val na = d.optString("access_token").ifEmpty { null }
-        val nr = d.optString("refresh_token").ifEmpty { null }
-        if (na != null) o.put("access", na)
-        if (nr != null) o.put("refresh", nr)
-        arr.put(i, o)
-        prefs.edit().putString("accounts", arr.toString()).apply()
-        return na ?: a
-    }
-
-    fun usageFor(key: String): Usage? = try {
-        val t = accessFor(key)
-        if (t == null) null else parseUsage(exec("GET", usageUrl, null, t, null, false).body)
     } catch (_: Exception) {
         null
     }
