@@ -15,9 +15,11 @@ import java.util.UUID
 
 class ApiError(val code: String, message: String, val http: Int = 0) : Exception(message)
 
+data class BranchMeta(val updatedAt: String = "", val createdAt: String = "", val message: String = "")
 data class Env(
     val id: String, val name: String, val repo: String, val branches: List<String>,
-    val isPrivate: Boolean = false, val pushed: String = "", val description: String = ""
+    val isPrivate: Boolean = false, val pushed: String = "", val description: String = "",
+    val branchMeta: Map<String, BranchMeta> = emptyMap()
 )
 data class TaskItem(
     val id: String, val title: String, val status: String, val updatedAt: Long,
@@ -368,13 +370,32 @@ class Api(ctx: Context) {
     private fun parseEnv(e: JSONObject): Env {
         val info = e.optJSONObject("meta")?.optJSONObject("repo_info")
         val bs = ArrayList<String>()
+        val metadata = LinkedHashMap<String, BranchMeta>()
         val ba = info?.optJSONArray("branches")
-        if (ba != null) for (k in 0 until ba.length()) bs.add(ba.getJSONObject(k).optString("name"))
+        if (ba != null) for (k in 0 until ba.length()) {
+            val branch = ba.optJSONObject(k) ?: continue
+            val name = branch.optString("name")
+            if (name.isBlank()) continue
+            bs.add(name)
+            val commit = branch.optJSONObject("commit")
+            fun nonNull(o: JSONObject?, key: String): String = if (o == null || o.isNull(key)) "" else o.optString(key)
+            val updated = listOf(
+                nonNull(branch, "last_commit_at"), nonNull(branch, "last_commit_date"),
+                nonNull(branch, "updated_at"), nonNull(branch, "pushed_at"),
+                nonNull(commit, "date"), nonNull(commit?.optJSONObject("commit")?.optJSONObject("committer"), "date")
+            ).firstOrNull { it.isNotBlank() }.orEmpty()
+            metadata[name] = BranchMeta(
+                updatedAt = updated,
+                createdAt = nonNull(branch, "created_at"),
+                message = nonNull(commit, "message").ifBlank { nonNull(branch, "last_commit_message") }
+            )
+        }
         return Env(
             e.optString("id"), e.optString("name"), e.optString("repo_name"), bs,
             info?.optBoolean("private") ?: false,
             info?.optString("pushed_at").orEmpty(),
-            info?.optString("description").orEmpty().let { if (it == "null") "" else it }
+            info?.optString("description").orEmpty().let { if (it == "null") "" else it },
+            metadata
         )
     }
 

@@ -145,6 +145,8 @@ class MainActivity : Activity() {
     private var pendingBase = 0
     private var shown: List<ChatMsg> = emptyList()
     private var envs: List<Env>? = null
+    private val branchHistories = HashMap<String, BranchHistory>()
+    private val pendingBranchHistories = HashSet<String>()
     private var tasks: List<TaskItem> = emptyList()
     private var selEnv: Env? = null
     private var selBranch = ""
@@ -1321,12 +1323,14 @@ class MainActivity : Activity() {
             leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(12); bottomMargin = dp(4)
         })
         val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, 0, dp(12)) }
-        root.addView(ScrollView(this).apply { addView(listBox, FrameLayout.LayoutParams(-1, -2)) }, lp(-1, 0, 1f))
+        val branchScroll = ScrollView(this).apply { addView(listBox, FrameLayout.LayoutParams(-1, -2)) }
+        root.addView(branchScroll, lp(-1, 0, 1f))
 
         var stage = 0
         var pickedEnv: Env? = null
         var ghState: Boolean? = null
         var filter = ""
+        var insightLimit = 8
 
         fun row(title: String, sub: String, selected: Boolean, iconRes: Int, onClick: () -> Unit): View {
             val r = LinearLayout(this).apply {
@@ -1353,7 +1357,7 @@ class MainActivity : Activity() {
                 text = sub
                 setTextColor(Theme.MUTED)
                 textSize = 12f
-                maxLines = 2
+                maxLines = 4
                 ellipsize = TextUtils.TruncateAt.END
             })
             r.addView(tb, lp(0, -2, 1f).apply { leftMargin = dp(12) })
@@ -1450,22 +1454,57 @@ class MainActivity : Activity() {
             val e = pickedEnv
             if (e != null) {
                 stage = 1
+                val oldScroll = branchScroll.scrollY
                 topTitle.text = e.repo.ifEmpty { e.name }
                 backBtn.setImageResource(R.drawable.ic_back)
                 search.hint = "Поиск ветки"
                 listBox.removeAllViews()
-                val bs = e.branches.sortedBy { if (it == "main" || it == "master") 0 else 1 }
-                val curBranch = if (selEnv?.id == e.id) selBranch else prefs.getString("branch_" + e.id, "").orEmpty()
-                val f = bs.filter { filter.isEmpty() || it.lowercase().contains(filter.lowercase()) }
-                if (f.isEmpty()) {
+                val base = defaultBranch(e)
+                val keyPrefix = e.repo.lowercase(Locale.ROOT) + "|"
+                fun key(b: String) = keyPrefix + b
+                val all = e.branches.sortedWith(compareByDescending<String> { branchHistories[key(it)]?.updatedAt
+                    ?: BranchHistoryService.timestamp(e.branchMeta[it]?.updatedAt.orEmpty()) }
+                    .thenBy { if (it == base) 0 else 1 })
+                val shown = all.filter { filter.isEmpty() || it.contains(filter, true) }
+                listBox.addView(TextView(this).apply {
+                    text = "Обновление — дата последнего коммита. ↑ впереди, ↓ позади основной ветки. Начало отличий ≠ дата создания."
+                    setTextColor(Theme.MUTED)
+                    textSize = 11.5f
+                    setPadding(dp(18), dp(8), dp(18), dp(4))
+                }, lp(-1, -2))
+                if (shown.isEmpty()) {
                     listBox.addView(TextView(this).apply {
-                        text = if (bs.isEmpty()) "Ветки не найдены. Нажмите «Обновить»" else "Ничего не найдено"
+                        text = if (all.isEmpty()) "Ветки не найдены. Нажмите «Обновить»" else "Ничего не найдено"
                         setTextColor(Theme.MUTED)
                         setPadding(dp(18), dp(18), dp(18), dp(8))
                     })
                 }
-                for (b in f) {
-                    listBox.addView(row(b, if (b == "main" || b == "master") "Основная ветка" else "", b == curBranch, R.drawable.ic_repo) {
+                val curBranch = if (selEnv?.id == e.id) selBranch else prefs.getString("branch_" + e.id, "").orEmpty()
+                for (b in shown) {
+                    val meta = e.branchMeta[b]
+                    val history = branchHistories[key(b)]
+                    val whenUpdated = history?.updatedAt?.takeIf { it > 0L }
+                        ?: BranchHistoryService.timestamp(meta?.updatedAt.orEmpty())
+                    val details = ArrayList<String>()
+                    if (whenUpdated > 0L) details.add("Коммит: " + BranchHistoryService.formatted(whenUpdated))
+                    else details.add("Дата последнего коммита неизвестна")
+                    if (history?.ahead != null && history.behind != null)
+                        details[0] += " · ↑" + history.ahead + " ↓" + history.behind
+                    val created = BranchHistoryService.timestamp(meta?.createdAt.orEmpty())
+                    if (created > 0L) details.add("Создана (данные Qwen): " + BranchHistoryService.formatted(created))
+                    else if (history != null && history.firstUniqueAt > 0L)
+                        details.add("Начало отличий ≈ " + BranchHistoryService.formatted(history.firstUniqueAt))
+                    if (history != null) {
+                        if (history.summary.isNotBlank()) details.add(history.category + " · " + history.summary)
+                        if (history.error.isNotBlank()) details.add(history.error)
+                    } else if (e.isPrivate) {
+                        details.add("Приватный репозиторий · подробная история недоступна")
+                    } else if (!pendingBranchHistories.contains(key(b))) {
+                        details.add("История ещё не загружена")
+                    } else {
+                        details.add("Загружаю изменения…")
+                    }
+                    listBox.addView(row(b, details.joinToString("\n"), b == curBranch, R.drawable.ic_repo) {
                         selEnv = e
                         selBranch = b
                         prefs.edit().putString("last_env_id", e.id).putString("branch_" + e.id, b).apply()
@@ -1473,7 +1512,38 @@ class MainActivity : Activity() {
                         dlg.dismiss()
                     })
                 }
-                listBox.addView(outlineButton("Обновить ветки") {
+                branchScroll.post { if (dlg.isShowing && stage == 1) branchScroll.scrollTo(0, oldScroll) }
+
+                // Limit requests: unauthenticated GitHub REST has a small rate limit.
+                // Every visible branch is selectable while its history loads.
+                if (!e.isPrivate) {
+                    val candidates = (shown.take(insightLimit) + listOf(curBranch).filter { it in shown }).distinct()
+                    for (b in candidates) {
+                        val k = key(b)
+                        val cached = branchHistories[k]
+                        if (pendingBranchHistories.contains(k) ||
+                            (cached != null && System.currentTimeMillis() - cached.checkedAt < 15 * 60_000L)) continue
+                        pendingBranchHistories.add(k)
+                        pool.execute {
+                            val result = BranchHistoryService.inspect(e.repo, b, base)
+                            ui.post {
+                                branchHistories[k] = result
+                                pendingBranchHistories.remove(k)
+                                if (dlg.isShowing && stage == 1 && pickedEnv?.id == e.id) showBranches()
+                            }
+                        }
+                    }
+                }
+                if (!e.isPrivate && shown.size > insightLimit) {
+                    listBox.addView(outlineButton("Проверить следующие 8 веток") {
+                        insightLimit += 8
+                        showBranches()
+                    }, lp(-1, -2).apply {
+                        leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(10)
+                    })
+                }
+                listBox.addView(outlineButton("Обновить ветки и историю") {
+                    branchHistories.keys.removeAll { it.startsWith(keyPrefix) }
                     pool.execute {
                         try {
                             val fresh = api.environment(e.id)
@@ -1486,7 +1556,9 @@ class MainActivity : Activity() {
                             ui.post { handleError(ex) }
                         }
                     }
-                }, lp(-1, -2).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(12) })
+                }, lp(-1, -2).apply {
+                    leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(12)
+                })
             }
         }
 

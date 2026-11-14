@@ -7,8 +7,8 @@ android {
         applicationId = "com.mallstorm.qwencoder"
         minSdk = 26
         targetSdk = 32
-        versionCode = 18
-        versionName = "4.8"
+        versionCode = 19
+        versionName = "4.9"
     }
     signingConfigs {
         // Постоянный ключ: все сборки подписываются одним сертификатом, поэтому APK ставится поверх предыдущего.
